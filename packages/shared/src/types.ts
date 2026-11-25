@@ -128,6 +128,7 @@ export type SystemEventType =
   | 'moderator_left'
   | 'moderator_fallback'
   | 'moderator_absent'
+  | 'moderator_alone'   // moderator present, but no other live agent to assign work to
   | 'host_invoked'
   | 'moderator_dispatched'
   | 'moderator_mention_unmatched'
@@ -244,6 +245,10 @@ export interface Room {
   // server-rejected on interview rooms.
   replyMode?: ReplyMode;
   modeConfig?: ReplyModeConfig;
+  // Epoch ms of the last setReplyMode. An agent's listen carries the full
+  // room policy only when it changed since the agent last read the room, or
+  // on the periodic refresh — not on every wake (see api/_mcpTools.ts).
+  modeChangedAt?: number;
   // Host-editable "project prompt": the room-as-project's standing background
   // and constraints. Set via the host-gated setProjectPrompt action, injected
   // into agent context (join responses + hosted-agent system prompts), and
@@ -454,7 +459,11 @@ export interface TaskBlock {
   reason: string;        // what exactly is missing — required
 }
 
-export type TaskWaitReason = 'missing_user_input' | 'missing_credential' | 'tool_failure' | 'dependency' | 'other';
+// running_job: the owner's own long command (a build, a crawl, a data
+// collection) is still running. Without it an agent holding an in_progress
+// task could not sit in a blocking room_listen, so it either ended its turn
+// (and dropped out of the room) or submitted partial evidence.
+export type TaskWaitReason = 'missing_user_input' | 'missing_credential' | 'tool_failure' | 'dependency' | 'running_job' | 'other';
 
 /** An explicit owner or review wait. Kept after resume as history. */
 export interface TaskWait extends TaskBlock {

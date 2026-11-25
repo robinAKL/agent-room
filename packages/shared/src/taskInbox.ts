@@ -39,7 +39,7 @@ export interface TaskInbox {
   /** Owned todo tasks waiting to be claimed. */
   queued: string[];
   /** Explicitly blocked owner/review responsibilities; never immediate work. */
-  waiting?: Array<{ id: string; scope: 'owner' | 'review'; kind?: 'capability' | 'decision'; reason: string; waitingFor?: string; resumeWhen?: string }>;
+  waiting?: Array<{ id: string; scope: 'owner' | 'review'; kind?: 'capability' | 'decision' | 'running_job'; reason: string; waitingFor?: string; resumeWhen?: string }>;
   /** Current review notification id per task, for room_task ack / review_start. */
   reviewEvents?: Record<string, string>;
   /** Owned tasks whose fenced execution ended and must be explicitly recovered. */
@@ -100,7 +100,8 @@ export function taskInboxFor(
       if (task.reviewStatus === 'waiting_for_capability') {
         waiting.push({ id: task.id, scope: 'review', kind: 'capability', reason: task.reviewReadiness ?? 'Required capabilities are unknown', resumeWhen: 'Report matching capabilities or reassign the review' });
       } else if (task.waiting?.scope === 'review' && task.waiting.resumedAt === undefined) {
-        waiting.push({ id: task.id, scope: 'review', reason: task.waiting.reason, waitingFor: task.waiting.waitingFor, resumeWhen: task.waiting.resumeWhen });
+        waiting.push({ id: task.id, scope: 'review', ...(task.waiting.reasonCode === 'running_job' ? { kind: 'running_job' as const } : {}),
+          reason: task.waiting.reason, waitingFor: task.waiting.waitingFor, resumeWhen: task.waiting.resumeWhen });
       } else {
         toVerify.push(task.id);
         if (task.notification?.kind === 'review_requested') reviewEvents[task.id] = task.notification.id;
@@ -118,7 +119,8 @@ export function taskInboxFor(
         }
       }
       if (task.state === 'blocked') {
-        waiting.push({ id: task.id, scope: 'owner', reason: task.waiting?.reason ?? task.blocked?.reason ?? 'Waiting for missing input',
+        waiting.push({ id: task.id, scope: 'owner', ...(task.waiting?.reasonCode === 'running_job' && task.waiting.resumedAt === undefined ? { kind: 'running_job' as const } : {}),
+          reason: task.waiting?.reason ?? task.blocked?.reason ?? 'Waiting for missing input',
           waitingFor: task.waiting?.waitingFor, resumeWhen: task.waiting?.resumeWhen });
       } else if (task.state === 'in_progress' || task.state === 'rejected') {
         active.push(task.id);
@@ -147,7 +149,7 @@ export function taskInboxFor(
   const parts: string[] = [];
   if (toRecover.length) parts.push(`RECOVERY REQUIRED: ${toRecover.join(', ')}. Read the attempt history/evidence and use room_task recover with a resolution. Lease expiry is not task failure or room expiry.`);
   if (waiting.length) parts.push(`WAITING: ${waiting.map(t => `${t.id}: ${t.reason}${t.resumeWhen ? `; resume when ${t.resumeWhen}` : ''}`).join(' | ')}. `
-    + 'Keep room_listen to receive missing input. Capability gaps need room_task capabilities or reassignment; repeated-rejection decisions need explicit reopen/cancel, not automatic recovery; input waits need room_task resume with a resolution. Ordinary chat does not release a wait.');
+    + 'Keep room_listen to receive missing input. A running_job wait is your own command still running: listen in short windows, check it between listens, and when it finishes room_task resume, then submit with the full evidence. Capability gaps need room_task capabilities or reassignment; repeated-rejection decisions need explicit reopen/cancel, not automatic recovery; input waits need room_task resume with a resolution. Ordinary chat does not release a wait.');
   if (toVerify.length) {
     parts.push(
       `${toVerify.join(', ')} ${toVerify.length === 1 ? 'is' : 'are'} awaiting YOUR verdict `

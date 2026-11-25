@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { hasMentionSyntax, mentionedAgents, wakesAgent, soleAgentOf } from './mentions.js';
+import { addressesOnlyHumans, hasMentionSyntax, mentionedAgents, mentionedNames, wakesAgent, soleAgentOf } from './mentions.js';
 
 const ROSTER = ['Claude', 'GPT', 'DeepSeek', 'Gemini'];
 
@@ -146,5 +146,65 @@ describe('soleAgentOf', () => {
 
   it('needs a name', () => {
     expect(soleAgentOf([human, codex], '  ')).toBe(false);
+  });
+});
+
+// "@x t d" — Robin could not mention a member whose name has spaces, and every
+// participant must be mentionable by every other: humans and agents alike.
+describe('mentionedNames', () => {
+  const NAMES = ['Claude', 'Grok', 'Codex', 'Robin', 'x t d'];
+
+  it('matches a spaced name whole', () => {
+    expect(mentionedNames('@x t d 看下这个', NAMES)).toEqual(['x t d']);
+    expect(mentionedNames('thanks @X T D!', NAMES)).toEqual(['x t d']);
+  });
+
+  it('finds humans and agents together, in roster order', () => {
+    expect(mentionedNames('@x t d and @Claude, ping @Robin', NAMES)).toEqual(['Claude', 'Robin', 'x t d']);
+  });
+
+  it('lets the longer name claim its span', () => {
+    expect(mentionedNames('@x t d hi', ['x', 'x t d'])).toEqual(['x t d']);
+    expect(mentionedNames('@x hi and @x t d', ['x', 'x t d'])).toEqual(['x', 'x t d']);
+  });
+
+  it('is empty without a mention', () => {
+    expect(mentionedNames('x t d said hi', NAMES)).toEqual([]);
+    expect(mentionedNames('', NAMES)).toEqual([]);
+  });
+});
+
+describe('addressesOnlyHumans', () => {
+  const ROOM = [
+    { name: 'Claude', client: 'cc' },
+    { name: 'Grok', client: 'cc' },
+    { name: 'Robin', client: 'web' },
+    { name: 'x t d', client: 'web' },
+  ];
+
+  it('is true for a mention of a spaced human name', () => {
+    expect(addressesOnlyHumans('@x t d can you check this', ROOM)).toBe(true);
+    expect(addressesOnlyHumans('@Robin done', ROOM)).toBe(true);
+  });
+
+  it('is false once an agent is mentioned too', () => {
+    expect(addressesOnlyHumans('@x t d and @Claude please compare', ROOM)).toBe(false);
+    expect(addressesOnlyHumans('@claude look', ROOM)).toBe(false);
+  });
+
+  it('is false with no mention or an unknown mention', () => {
+    expect(addressesOnlyHumans('hello everyone', ROOM)).toBe(false);
+    expect(addressesOnlyHumans('@nobody hi', ROOM)).toBe(false);
+    expect(addressesOnlyHumans('mail x t d at me@x t d', ROOM)).toBe(false);
+  });
+
+  it('treats a suffixed agent seat as answering to its base name', () => {
+    const seats = [{ name: 'Claude (2)', client: 'cc' }, { name: 'Robin', client: 'web' }];
+    expect(addressesOnlyHumans('@Robin and @Claude', seats)).toBe(false);
+  });
+
+  it('does not let an agent named inside a human name count', () => {
+    const seats = [{ name: 'x', client: 'cc' }, { name: 'x t d', client: 'web' }];
+    expect(addressesOnlyHumans('@x t d hi', seats)).toBe(true);
   });
 });

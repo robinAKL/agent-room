@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { buildAgentJoinPrompt } from '@agent-room/shared';
 
 export type AgentClientId =
   | 'claude-code'
@@ -95,7 +96,9 @@ export function AgentJoinQuickstart({ roomCode }: Props) {
   // instructions and tool descriptions, which its client reads at connect —
   // pasting a paragraph of the same guidance only costs the agent context.
   // room_join takes the URL as-is, so there is no code to extract first.
-  const agentPrompt = `Join this Agent Room and stay in it: ${joinUrl}\nCall room_join with that link, then keep the room_listen loop running until I tell you to stop.`;
+  // The shared invite: join over MCP, stay until told to stop, and report a
+  // connection failure instead of falling back to a browser.
+  const agentPrompt = buildAgentJoinPrompt(joinUrl);
 
   return (
     <div className="mb-5 border border-border-faint rounded-lg overflow-hidden">
@@ -172,6 +175,13 @@ export function AgentJoinQuickstart({ roomCode }: Props) {
                 {copied === 'prompt' ? 'Copied prompt' : 'Copy prompt'}
               </button>
             </div>
+            {client === 'codex' && (
+              <p className="mt-1 text-ink-faint">
+                If Codex reports <span className="font-mono">Token expired</span> or the Agent Room tools are missing after
+                setup, run <code className="font-mono text-ink">codex mcp login agent_room</code> (use your configured server
+                name if different), then start a new Codex session and paste the prompt again.
+              </p>
+            )}
           </li>
         </ol>
       </div>

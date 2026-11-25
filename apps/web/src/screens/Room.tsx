@@ -2,8 +2,10 @@ import { useRef, useState, useEffect, useCallback, type ClipboardEvent, type Dra
 import { useParams, useNavigate } from 'react-router-dom';
 import { useRoom } from '../hooks/useRoom.js';
 import { useTaskBoard } from '../hooks/useTaskBoard.js';
-import { Bubble } from '../components/Bubble.js';
+import { Bubble, MentionNamesProvider } from '../components/Bubble.js';
+import { insertMentionText, mentionCandidates as findMentionCandidates, mentionQueryAt, mentionRoleLabel } from '../lib/mentions.js';
 import { AgentCapabilities } from '../components/AgentCapabilities.js';
+import { pendingAgentStarts } from '../lib/pendingAgentStarts.js';
 import { TaskBoard, canRuleOn } from '../components/TaskBoard.js';
 import { VoiceButton } from '../components/VoiceButton.js';
 import { MeetingCodePill } from '../components/MeetingCodePill.js';
@@ -11,7 +13,7 @@ import { Avatar } from '../components/Avatar.js';
 import { AgentRoomLogo } from '../components/AgentRoomLogo.js';
 import { AgentJoinNotice } from '../components/AgentJoinNotice.js';
 import { colorForName, initialsFor } from '../lib/colors.js';
-import { PRESENCE_STALE_MS, PRESENCE_DISCONNECTED_MS, extractArtifacts, type Message, type MessageAttachment, type Participant, type ReplyMode, type ReplyModeConfig, type SystemEventType } from '@agent-room/shared';
+import { PRESENCE_STALE_MS, PRESENCE_DISCONNECTED_MS, buildAgentResumePrompt, extractArtifacts, type Message, type MessageAttachment, type Participant, type ReplyMode, type ReplyModeConfig, type SystemEventType } from '@agent-room/shared';
 import { appendSystemMessage, directInvoke, getTurnState, hostSkipCurrent, setMuted, setReplyMode, createClient, createRoomReport, endRoom as endRoomApi, reactivateRoom as reactivateRoomApi, removeParticipant, type TurnState } from '@agent-room/upstash-client';
 import { ENV } from '../env.js';
 import { copyText } from '../lib/copy.js';
@@ -50,6 +52,11 @@ export function Room() {
   }, [self, code, navigate]);
   const { room, messages, error, sendMessage, refreshRoom, forceRefresh } = useRoom(code, self?.name ?? '');
   const [text, setText] = useState('');
+  // @-mention picker: caret position, highlighted row, and whether the
+  // composer has focus (the list only shows while typing in it).
+  const [mentionCursor, setMentionCursor] = useState(0);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const [composerFocused, setComposerFocused] = useState(false);
   const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
   const [attachBusy, setAttachBusy] = useState(false);
   const [dragActive, setDragActive] = useState(false);
@@ -548,6 +555,28 @@ export function Room() {
     });
   }
 
+  // Everyone but the viewer can be @-mentioned: agents, the host, members.
+  // Names may contain spaces; mentionQueryAt keeps the query open while it
+  // still starts somebody's name.
+  const roster = room?.participants ?? [];
+  const mentionLookup = mentionQueryAt(text, Math.min(mentionCursor || text.length, text.length), roster.map(p => p.name));
+  const mentionCandidates = mentionLookup ? findMentionCandidates(roster, mentionLookup.query, self.name) : [];
+  const showMentionSuggestions = composerFocused && !!mentionLookup && mentionCandidates.length > 0;
+
+  function insertMention(name: string) {
+    if (!mentionLookup) return;
+    const { text: next, caret } = insertMentionText(text, mentionLookup, name);
+    setText(next);
+    setMentionCursor(caret);
+    setMentionIndex(0);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(caret, caret);
+    });
+  }
+
   async function send() {
     const body = text.trim();
     if ((!body && attachments.length === 0) || ended) return;
@@ -870,6 +899,9 @@ export function Room() {
                   const canMuteToggle = isMeHost && !isSelf && !ended;
                   const canAsk = canConfigureReplyMode && p.client === 'cc' && !isMuted;
                   const presence = participantPresence(p, now);
+                  // Presence and starting work are different facts: only the
+                  // board records that an assigned task or review was started.
+                  const pendingStarts = p.client === 'cc' && !ended ? pendingAgentStarts(taskBoard.board, p.name) : null;
                   // Whole-row visual fade for participants who haven't been
                   // seen in a while — keeps the row legible but signals
                   // "probably gone" without screaming about it.
@@ -899,6 +931,21 @@ export function Room() {
                           {presence.detail && <span className="text-ink-faint">· {presence.detail}</span>}
                         </div>
                         <AgentCapabilities participant={p} />
+                        {pendingStarts && (
+                          <div className="mt-1.5 border-t border-border-faint pt-1.5 text-[11px] leading-snug">
+                            <div className="font-semibold text-amber-800" title="No start has been recorded on the task board">
+                              {pendingStarts} not started
+                            </div>
+                            <button
+                              type="button"
+                              aria-label={`Copy resume instructions for ${p.name}`}
+                              onClick={() => copyText(buildAgentResumePrompt(joinUrl, p.name), 'Resume instructions copied. Paste them into the agent’s chat.')}
+                              className="mt-1 min-h-8 text-left font-semibold text-accent underline-offset-2 hover:underline focus-visible:underline"
+                            >
+                              Copy resume instructions
+                            </button>
+                          </div>
+                        )}
                       </div>
                       {/*
                         Host controls — always visible (no hover-to-reveal).
@@ -1000,14 +1047,18 @@ export function Room() {
                 }
                 const ambiguousNames = new Set<string>();
                 for (const [n, cs] of byName) if (cs.size > 1) ambiguousNames.add(n);
-                return messages.map(m => (
-                  <Bubble
-                    key={m.id}
-                    message={m}
-                    self={m.name === self.name}
-                    ambiguousNames={ambiguousNames}
-                  />
-                ));
+                return (
+                  <MentionNamesProvider value={(room?.participants ?? []).map(p => p.name).join('\n')}>
+                    {messages.map(m => (
+                      <Bubble
+                        key={m.id}
+                        message={m}
+                        self={m.name === self.name}
+                        ambiguousNames={ambiguousNames}
+                      />
+                    ))}
+                  </MentionNamesProvider>
+                );
               })()}
 
               {messages.length === 0 && (
@@ -1190,12 +1241,56 @@ export function Room() {
                 </div>
                 <div className="flex flex-col sm:flex-row sm:items-end gap-2">
                   <div className="relative flex-1 min-w-0">
+                    {showMentionSuggestions && (
+                      <div className="absolute bottom-[calc(100%+0.5rem)] left-0 right-0 z-30 overflow-hidden rounded-lg border border-border bg-white shadow-card">
+                        <div className="border-b border-border-faint px-3 py-2 text-[10px] font-semibold uppercase text-ink-faint">
+                          Mention
+                        </div>
+                        <div className="max-h-56 overflow-y-auto p-1" role="listbox" aria-label="Mention someone">
+                          {mentionCandidates.map((person, index) => (
+                            <button
+                              key={`${person.name}-${person.client}`}
+                              type="button"
+                              role="option"
+                              aria-selected={index === Math.min(mentionIndex, mentionCandidates.length - 1)}
+                              onMouseDown={e => { e.preventDefault(); insertMention(person.name); }}
+                              className={`flex min-h-10 w-full min-w-0 items-center gap-2 rounded-md px-2 py-2 text-left text-sm ${index === Math.min(mentionIndex, mentionCandidates.length - 1) ? 'bg-accent-tint text-accent' : 'text-ink hover:bg-surface-softer'}`}
+                            >
+                              <Avatar initials={person.initials} color={person.color} size="sm" />
+                              <span className="min-w-0 flex-1 truncate font-semibold">@{person.name}</span>
+                              <span className="shrink-0 truncate text-[11px] text-ink-faint">{mentionRoleLabel(person, room?.createdBy)}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                     <textarea
                       ref={textareaRef}
                       value={text}
-                      onChange={e => setText(e.target.value)}
+                      onChange={e => { setText(e.target.value); setMentionCursor(e.target.selectionStart ?? e.target.value.length); setMentionIndex(0); }}
+                      onSelect={e => setMentionCursor(e.currentTarget.selectionStart ?? 0)}
+                      onFocus={() => setComposerFocused(true)}
+                      onBlur={() => setComposerFocused(false)}
                       onPaste={e => { void handlePaste(e); }}
                       onKeyDown={e => {
+                        if (showMentionSuggestions) {
+                          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                            e.preventDefault();
+                            const step = e.key === 'ArrowDown' ? 1 : -1;
+                            setMentionIndex(i => (Math.min(i, mentionCandidates.length - 1) + step + mentionCandidates.length) % mentionCandidates.length);
+                            return;
+                          }
+                          if ((e.key === 'Enter' || e.key === 'Tab') && !e.nativeEvent.isComposing) {
+                            e.preventDefault();
+                            insertMention(mentionCandidates[Math.min(mentionIndex, mentionCandidates.length - 1)]!.name);
+                            return;
+                          }
+                          if (e.key === 'Escape') {
+                            e.preventDefault();
+                            setComposerFocused(false);
+                            return;
+                          }
+                        }
                         // Desktop: Enter sends; Shift+Enter for new line.
                         // Mobile touch: let Enter insert a newline so user can type freely without accidental send.
                         const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
