@@ -24,6 +24,7 @@ import {
   normalizeTaskRequirements,
   participantMemberId,
   recordTaskTimeline,
+  roomDestroyAt,
   taskLeaseTtl,
 } from '@agent-room/shared';
 import type { UpstashClient } from './client.js';
@@ -121,14 +122,21 @@ function taskBoardKey(code: string): string {
 // deploy doesn't leak it forever.
 const BOARD_ROOMS_KEY = 'task-board:rooms';
 
+// Seconds until the room's retention deadline (roomRetention.ts), so the
+// board expires with the room. A board written after the room is gone keeps
+// the legacy one-day lifetime.
 async function roomRetentionSeconds(client: UpstashClient, code: string, known?: string | null): Promise<number> {
   const raw = known !== undefined ? known : await client.command<string | null>(['GET', `room:${code}`]);
   if (!raw) return ROOM_TTL_SECONDS;
   try {
-    const value = (JSON.parse(raw) as { retentionSeconds?: unknown }).retentionSeconds;
-    return typeof value === 'number' && Number.isFinite(value) && value > 0
-      ? Math.floor(value)
-      : ROOM_TTL_SECONDS;
+    const room = JSON.parse(raw) as Room & { retentionSeconds?: unknown };
+    // A room record carrying its own retention (imported or plan-retained
+    // rooms) keeps it.
+    if (typeof room.retentionSeconds === 'number' && Number.isFinite(room.retentionSeconds) && room.retentionSeconds > 0) {
+      return Math.floor(room.retentionSeconds);
+    }
+    if (typeof room.createdAt !== 'number') return ROOM_TTL_SECONDS;
+    return Math.max(1, Math.ceil((roomDestroyAt(room) - Date.now()) / 1000));
   } catch {
     return ROOM_TTL_SECONDS;
   }

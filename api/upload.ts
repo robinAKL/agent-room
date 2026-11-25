@@ -14,68 +14,17 @@
 // object key lets us batch-delete by room when the meeting ends.
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
-import { randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
+import { AttachmentStorageError, MAX_UPLOAD_BYTES, readR2Env, storeRoomAttachment } from './_roomAttachmentStorage.js';
 
-const MAX_BYTES = 10 * 1024 * 1024;
-const ALLOWED_MIMES = new Set([
-  'image/png',
-  'image/jpeg',
-  'image/jpg',
-  'image/webp',
-  'image/gif',
-  'image/svg+xml',
-  'application/pdf',
-  'text/plain',
-  'text/markdown',
-  'text/html',
-  'text/csv',
-  'application/json',
-  'application/zip',
-  'application/vnd.ms-excel',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-]);
+// Which files are shared, how their MIME is resolved, and how risky ones are
+// labelled lives in _roomAttachmentStorage.ts, shared with the MCP room_upload
+// tool. Any file type may be shared: known formats keep their MIME for
+// previews and text extraction, everything else is a binary download, and
+// executables carry a warning rather than being refused.
+const MAX_BYTES = MAX_UPLOAD_BYTES;
 
 export const config = { api: { bodyParser: false } };
-
-interface R2Env {
-  accountId: string;
-  bucket: string;
-  publicUrl: string;
-  accessKeyId: string;
-  secretAccessKey: string;
-}
-
-// Read every R2 var up front so we can return one clean 503 listing what's
-// missing instead of crashing inside the SDK with a cryptic message.
-function readR2Env(): R2Env | { missing: string[] } {
-  const env = {
-    accountId: process.env.R2_ACCOUNT_ID,
-    bucket: process.env.R2_BUCKET,
-    publicUrl: process.env.R2_PUBLIC_URL,
-    accessKeyId: process.env.R2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-  };
-  const missing = Object.entries(env).filter(([, v]) => !v).map(([k]) => k);
-  if (missing.length) return { missing };
-  return env as R2Env;
-}
-
-let cachedClient: S3Client | null = null;
-function getR2Client(env: R2Env): S3Client {
-  if (cachedClient) return cachedClient;
-  cachedClient = new S3Client({
-    region: 'auto',
-    endpoint: `https://${env.accountId}.r2.cloudflarestorage.com`,
-    credentials: {
-      accessKeyId: env.accessKeyId,
-      secretAccessKey: env.secretAccessKey,
-    },
-  });
-  return cachedClient;
-}
 
 export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
   if (req.method !== 'POST') {
@@ -140,52 +89,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
     res.status(413).json({ error: 'file_too_large', message: `File exceeds ${MAX_BYTES} bytes (10 MB).` });
     return;
   }
-  const mime = filePart.contentType ?? 'application/octet-stream';
-  if (!ALLOWED_MIMES.has(mime)) {
-    res.status(415).json({ error: 'mime_not_allowed', message: `Unsupported MIME type: ${mime}` });
-    return;
-  }
 
-  const id = randomUUID();
-  const safeName = (filePart.filename ?? 'file').replace(/[/\\]/g, '_').slice(0, 200) || 'file';
-  const key = `rooms/${roomCode}/${id}/${safeName}`;
-
-  try {
-    await getR2Client(env).send(new PutObjectCommand({
-      Bucket: env.bucket,
-      Key: key,
-      Body: filePart.data,
-      ContentType: mime,
-      // Cache aggressively: object keys are content-addressable
-      // (uuid in path) so an attachment's bytes never change.
-      CacheControl: 'public, max-age=31536000, immutable',
-    }));
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : 'unknown';
-    res.status(500).json({ error: 'r2_put_failed', message: `R2 upload failed: ${msg}` });
-    return;
-  }
-
-  // Public URL via the R2.dev subdomain (or custom domain if you swap it
-  // later — we just env-var the prefix so the swap is one variable change).
-  const publicUrl = `${env.publicUrl.replace(/\/$/, '')}/${key}`;
-
-  const isImage = mime.startsWith('image/');
   const widthNum = widthPart ? Number(widthPart.data.toString('utf8')) : NaN;
   const heightNum = heightPart ? Number(heightPart.data.toString('utf8')) : NaN;
-
-  const attachment = {
-    id,
-    type: isImage ? 'image' : 'file',
-    url: publicUrl,
-    storageKey: key,
-    name: filePart.filename ?? 'file',
-    size: filePart.data.length,
-    mime,
-    uploadedAt: Date.now(),
-    ...(isImage && Number.isFinite(widthNum) && widthNum > 0 ? { width: widthNum } : {}),
-    ...(isImage && Number.isFinite(heightNum) && heightNum > 0 ? { height: heightNum } : {}),
-  };
+  let attachment;
+  try {
+    attachment = await storeRoomAttachment({
+      roomCode,
+      filename: filePart.filename ?? 'file',
+      bytes: filePart.data,
+      mime: filePart.contentType,
+      provenance: 'user_upload',
+      width: widthNum,
+      height: heightNum,
+    });
+  } catch (e) {
+    if (e instanceof AttachmentStorageError) {
+      res.status(e.status).json({ error: e.name, message: e.message });
+      return;
+    }
+    throw e;
+  }
 
   res.status(201).json(attachment);
 }

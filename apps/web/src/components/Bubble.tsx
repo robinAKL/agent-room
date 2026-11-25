@@ -1,7 +1,7 @@
 import { Avatar } from './Avatar.js';
-import { createContext, useContext, useMemo, type ReactNode } from 'react';
+import { createContext, memo, useContext, useMemo, type ReactNode } from 'react';
 import type { Message, MessageAttachment } from '@agent-room/shared';
-import { normalizeEscapedWhitespace } from '@agent-room/shared';
+import { EXECUTABLE_ATTACHMENT_WARNING, isExecutableAttachment, normalizeEscapedWhitespace } from '@agent-room/shared';
 import { mentionTokenSource } from '../lib/mentions.js';
 
 /**
@@ -23,8 +23,21 @@ interface Props {
   ambiguousNames?: Set<string>;
 }
 
-export function Bubble({ message, self, ambiguousNames }: Props) {
+// Memoized: Room re-renders on every composer keystroke, and a long room holds
+// thousands of bubbles. Room keeps these props stable, so an unchanged message
+// is skipped instead of re-rendered.
+export const Bubble = memo(BubbleView);
+
+function BubbleView({ message, self, ambiguousNames }: Props) {
   if (message.type === 'sys') {
+    if (message.metadata?.eventType === 'attachment_warning') {
+      return (
+        <div role="status" className="mx-auto max-w-[min(620px,92%)] rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
+          <strong>Agent Room Safety</strong>
+          <p className="break-words">{message.text}</p>
+        </div>
+      );
+    }
     return (
       <div className="mx-auto max-w-[min(620px,92%)] rounded-full border border-border-faint bg-surface px-3 py-1.5 text-center text-[11px] font-semibold text-ink-soft shadow-sm">
         {systemEventLabel(message)}
@@ -75,11 +88,11 @@ function systemEventLabel(message: Message): string {
   return message.text;
 }
 
-function AttachmentList({ attachments }: { attachments: MessageAttachment[] }) {
+export function AttachmentList({ attachments }: { attachments: MessageAttachment[] }) {
   return (
     <div className="mt-2 space-y-2">
       {attachments.map(attachment => (
-        attachment.type === 'image'
+        attachment.type === 'image' && !isExecutableAttachment(attachment)
           ? <ImageAttachment key={attachment.id} attachment={attachment} />
           : <FileAttachment key={attachment.id} attachment={attachment} />
       ))}
@@ -105,16 +118,20 @@ function ImageAttachment({ attachment }: { attachment: MessageAttachment }) {
 }
 
 function FileAttachment({ attachment }: { attachment: MessageAttachment }) {
+  const executable = isExecutableAttachment(attachment);
   return (
-    <div className="flex items-center gap-3 rounded-lg border border-black/10 bg-black/5 px-3 py-2 text-[11px]">
+    // flex-wrap: on a narrow phone the warning drops onto its own row
+    // instead of squeezing the name and the action buttons.
+    <div className="flex flex-wrap items-center gap-3 rounded-lg border border-black/10 bg-black/5 px-3 py-2 text-[11px]">
       <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-white/70 font-bold text-[10px] text-ink-muted">
         {fileTypeLabel(attachment)}
       </div>
       <div className="min-w-0 flex-1">
         <div className="truncate font-semibold">{attachment.name}</div>
-        <div className="opacity-60">{formatBytes(attachment.size)} · {attachment.mime}</div>
+        <div className="break-all opacity-60">{formatBytes(attachment.size)} · {attachment.mime}</div>
       </div>
       <AttachmentActions attachment={attachment} />
+      {executable && <p className="basis-full text-amber-800">{EXECUTABLE_ATTACHMENT_WARNING}</p>}
     </div>
   );
 }
@@ -122,14 +139,15 @@ function FileAttachment({ attachment }: { attachment: MessageAttachment }) {
 function AttachmentActions({ attachment }: { attachment: MessageAttachment }) {
   return (
     <div className="flex shrink-0 items-center gap-1.5">
-      <a
+      {/* A file that can run code is a download only: never opened in a tab. */}
+      {!isExecutableAttachment(attachment) && <a
         href={attachment.url}
         target="_blank"
         rel="noreferrer"
         className="rounded-md border border-black/10 bg-white/70 px-2 py-1 font-semibold hover:bg-white"
       >
         Open
-      </a>
+      </a>}
       <a
         href={attachment.url}
         download={attachment.name}
@@ -148,6 +166,7 @@ function fileTypeLabel(attachment: MessageAttachment): string {
   if (mime === 'text/html' || name.endsWith('.html') || name.endsWith('.htm')) return 'HTML';
   if (mime === 'text/csv' || name.endsWith('.csv')) return 'CSV';
   if (mime.includes('spreadsheetml') || mime === 'application/vnd.ms-excel' || name.endsWith('.xlsx') || name.endsWith('.xls')) return 'XLS';
+  if (/\.(?:ppt|pptx|pptm)$/i.test(name)) return 'PPT';
   if (mime.includes('wordprocessingml') || name.endsWith('.docx')) return 'DOC';
   if (mime.startsWith('image/')) return 'IMG';
   if (mime === 'application/zip' || name.endsWith('.zip')) return 'ZIP';

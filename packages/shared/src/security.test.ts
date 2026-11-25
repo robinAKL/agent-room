@@ -47,3 +47,27 @@ describe('execution kill switch', () => {
     expect(isCodeExecutionEnabled('1')).toBe(true);
   });
 });
+
+// From #745: executable uploads are shared with a warning, so classification
+// and byte sniffing decide what gets the warning.
+import { hasExecutableSignature, isExecutableAttachment } from './security.js';
+
+describe('executable attachments', () => {
+  it('recognises native binaries and scripts by their bytes, whatever the name', () => {
+    expect(hasExecutableSignature(new Uint8Array([0x7f, 0x45, 0x4c, 0x46]))).toBe(true); // ELF
+    expect(hasExecutableSignature(new TextEncoder().encode('#!/bin/sh\necho hi'))).toBe(true);
+    const pe = new Uint8Array(128); pe[0] = 0x4d; pe[1] = 0x5a; pe[0x3c] = 64; pe.set([0x50, 0x45, 0, 0], 64);
+    expect(hasExecutableSignature(pe)).toBe(true);
+    expect(hasExecutableSignature(new TextEncoder().encode('MZ but just text that is long enough to have a header field at 0x3c ...'))).toBe(false);
+    expect(hasExecutableSignature(new TextEncoder().encode('plain text'))).toBe(false);
+  });
+
+  it('treats macro-enabled Office files and scripts as executable, documents as not', () => {
+    for (const name of ['report.xlsm', 'deck.pptm', 'run.ps1', 'tool.exe', 'install.sh ']) {
+      expect(isExecutableAttachment({ name, mime: 'application/octet-stream' })).toBe(true);
+    }
+    expect(isExecutableAttachment({ name: 'x', mime: 'application/vnd.ms-excel.sheet.macroEnabled.12' })).toBe(true);
+    expect(isExecutableAttachment({ name: 'report.xlsx', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })).toBe(false);
+    expect(isExecutableAttachment({ name: 'notes.md', mime: 'text/markdown', riskClass: 'executable' })).toBe(true);
+  });
+});

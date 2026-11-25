@@ -1,4 +1,4 @@
-import { useRef, useState, useEffect, useCallback, type ClipboardEvent, type DragEvent } from 'react';
+import { useRef, useState, useEffect, useCallback, useMemo, type ClipboardEvent, type DragEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useRoom } from '../hooks/useRoom.js';
 import { useTaskBoard } from '../hooks/useTaskBoard.js';
@@ -6,6 +6,8 @@ import { Bubble, MentionNamesProvider } from '../components/Bubble.js';
 import { insertMentionText, mentionCandidates as findMentionCandidates, mentionQueryAt, mentionRoleLabel } from '../lib/mentions.js';
 import { AgentCapabilities } from '../components/AgentCapabilities.js';
 import { pendingAgentStarts } from '../lib/pendingAgentStarts.js';
+import { agentsWithTaskInProgress, participantPresence } from '../lib/participantPresence.js';
+import { resumePromptFor } from '../lib/resumePrompt.js';
 import { TaskBoard, canRuleOn } from '../components/TaskBoard.js';
 import { VoiceButton } from '../components/VoiceButton.js';
 import { MeetingCodePill } from '../components/MeetingCodePill.js';
@@ -299,7 +301,24 @@ export function Room() {
 
   const [mobilePanel, setMobilePanel] = useState<'chat' | 'tasks' | 'people'>('chat');
   const [reportBusy, setReportBusy] = useState(false);
-  const artifacts = extractArtifacts(messages);
+  // The composer's `text` lives in this component, so every keystroke
+  // re-renders Room. In a long room that used to re-render every bubble and
+  // rescan the whole transcript per key (from #776). Work that depends only on
+  // the messages or the roster is memoized, and Bubble is memoized on props
+  // that keep their identity across renders.
+  const artifacts = useMemo(() => extractArtifacts(messages), [messages]);
+  // A name used by both a web and a cc participant is disambiguated as
+  // "Name · web" / "Name · cc" in each bubble.
+  const ambiguousNames = useMemo(() => {
+    const byName = new Map<string, Set<string>>();
+    for (const p of room?.participants ?? []) {
+      if (!byName.has(p.name)) byName.set(p.name, new Set());
+      byName.get(p.name)!.add(p.client);
+    }
+    const names = new Set<string>();
+    for (const [n, cs] of byName) if (cs.size > 1) names.add(n);
+    return names;
+  }, [room?.participants]);
   // Board lives here, not inside TaskBoard, so the tab strip can badge how
   // many deliveries are waiting on a ruling while the user is on Chat.
   const taskBoard = useTaskBoard(code);
@@ -562,6 +581,8 @@ export function Room() {
   const mentionLookup = mentionQueryAt(text, Math.min(mentionCursor || text.length, text.length), roster.map(p => p.name));
   const mentionCandidates = mentionLookup ? findMentionCandidates(roster, mentionLookup.query, self.name) : [];
   const showMentionSuggestions = composerFocused && !!mentionLookup && mentionCandidates.length > 0;
+  // Agents holding an in-progress task read as Working while they are quiet.
+  const busyAgents = agentsWithTaskInProgress(taskBoard.board);
 
   function insertMention(name: string) {
     if (!mentionLookup) return;
@@ -898,10 +919,14 @@ export function Room() {
                   const isMuted = p.canSpeak === false;
                   const canMuteToggle = isMeHost && !isSelf && !ended;
                   const canAsk = canConfigureReplyMode && p.client === 'cc' && !isMuted;
-                  const presence = participantPresence(p, now);
+                  const presence = participantPresence(p, now, p.client === 'cc' && busyAgents.has(p.name.toLowerCase()));
                   // Presence and starting work are different facts: only the
                   // board records that an assigned task or review was started.
                   const pendingStarts = p.client === 'cc' && !ended ? pendingAgentStarts(taskBoard.board, p.name) : null;
+                  // An agent that stopped listening can be handed back its seat
+                  // with one paste; the host is the one who can do that.
+                  const resumePrompt = isMeHost && !ended && !pendingStarts
+                    ? resumePromptFor(p, presence.kind, code, window.location.origin) : undefined;
                   // Whole-row visual fade for participants who haven't been
                   // seen in a while — keeps the row legible but signals
                   // "probably gone" without screaming about it.
@@ -913,7 +938,7 @@ export function Room() {
                   return (
                     <div
                       key={`${p.name}-${p.client}`}
-                      className={`flex items-center gap-2 rounded-lg border px-2.5 py-2 transition ${rowFade} ${isMuted ? 'border-amber-300 bg-amber-50/60' : 'border-border-faint bg-surface-softer'}`}
+                      className={`flex flex-wrap items-center gap-2 rounded-lg border px-2.5 py-2 transition ${rowFade} ${isMuted ? 'border-amber-300 bg-amber-50/60' : 'border-border-faint bg-surface-softer'}`}
                     >
                       <Avatar initials={p.initials} color={p.color} size="sm" />
                       <div className="min-w-0 flex-1">
@@ -930,22 +955,6 @@ export function Room() {
                           <span>{presence.label}</span>
                           {presence.detail && <span className="text-ink-faint">· {presence.detail}</span>}
                         </div>
-                        <AgentCapabilities participant={p} />
-                        {pendingStarts && (
-                          <div className="mt-1.5 border-t border-border-faint pt-1.5 text-[11px] leading-snug">
-                            <div className="font-semibold text-amber-800" title="No start has been recorded on the task board">
-                              {pendingStarts} not started
-                            </div>
-                            <button
-                              type="button"
-                              aria-label={`Copy resume instructions for ${p.name}`}
-                              onClick={() => copyText(buildAgentResumePrompt(joinUrl, p.name), 'Resume instructions copied. Paste them into the agent’s chat.')}
-                              className="mt-1 min-h-8 text-left font-semibold text-accent underline-offset-2 hover:underline focus-visible:underline"
-                            >
-                              Copy resume instructions
-                            </button>
-                          </div>
-                        )}
                       </div>
                       {/*
                         Host controls — always visible (no hover-to-reveal).
@@ -1006,6 +1015,37 @@ export function Room() {
                           )}
                         </div>
                       )}
+                      {/* Below the row, full width, so the host controls never squeeze it. */}
+                      {p.client === 'cc' && (
+                        <div className="basis-full min-w-0 pl-8">
+                          <AgentCapabilities participant={p} />
+                          {resumePrompt && (
+                            <button
+                              type="button"
+                              onClick={() => copyText(resumePrompt, 'Resume prompt copied. Paste it into the agent’s own client.')}
+                              title="Copy a prompt to paste into this agent's own client so it rejoins this seat and resumes"
+                              className="mt-1 min-h-8 text-left text-[11px] font-semibold text-accent underline-offset-2 hover:underline focus-visible:underline"
+                            >
+                              Copy resume prompt
+                            </button>
+                          )}
+                          {pendingStarts && (
+                            <div className="mt-1.5 border-t border-border-faint pt-1.5 text-[11px] leading-snug">
+                              <div className="font-semibold text-amber-800" title="No start has been recorded on the task board">
+                                {pendingStarts} not started
+                              </div>
+                              <button
+                                type="button"
+                                aria-label={`Copy resume instructions for ${p.name}`}
+                                onClick={() => copyText(buildAgentResumePrompt(joinUrl, p.name), 'Resume instructions copied. Paste them into the agent’s chat.')}
+                                className="mt-1 min-h-8 text-left font-semibold text-accent underline-offset-2 hover:underline focus-visible:underline"
+                              >
+                                Copy resume instructions
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -1038,15 +1078,6 @@ export function Room() {
 
             <div ref={feedRef} className="flex-1 min-w-0 overflow-y-auto overflow-x-hidden p-3 sm:p-5 flex flex-col gap-3 bg-surface-soft relative">
               {(() => {
-                // Names that appear with more than one client in the room get
-                // disambiguated as "Name · web" / "Name · cc" in each bubble.
-                const byName = new Map<string, Set<string>>();
-                for (const p of room?.participants ?? []) {
-                  if (!byName.has(p.name)) byName.set(p.name, new Set());
-                  byName.get(p.name)!.add(p.client);
-                }
-                const ambiguousNames = new Set<string>();
-                for (const [n, cs] of byName) if (cs.size > 1) ambiguousNames.add(n);
                 return (
                   <MentionNamesProvider value={(room?.participants ?? []).map(p => p.name).join('\n')}>
                     {messages.map(m => (
@@ -1316,7 +1347,6 @@ export function Room() {
                         type="file"
                         multiple
                         className="hidden"
-                        accept={Array.from(ALLOWED_ATTACHMENT_TYPES).join(',')}
                         onChange={e => { if (e.target.files) void addFiles(e.target.files); }}
                       />
                       <button
@@ -1393,50 +1423,4 @@ function PendingAttachment({ attachment, onRemove }: { attachment: MessageAttach
       </button>
     </div>
   );
-}
-
-function participantPresence(p: Participant, now: number) {
-  if (p.listenUntil && p.listenUntil > now) {
-    return {
-      kind: 'listening' as const,
-      label: 'Listening now',
-      detail: '',
-      className: 'text-emerald-700',
-      dotClassName: 'bg-emerald-500',
-    };
-  }
-
-  if (now - p.lastSeenAt <= PRESENCE_STALE_MS) {
-    return {
-      kind: 'online' as const,
-      label: 'Online',
-      detail: '',
-      className: 'text-blue-700',
-      dotClassName: 'bg-blue-500',
-    };
-  }
-
-  // Past 5 minutes silent → almost certainly disconnected. Most common cause:
-  // a CLI agent (Cursor / Claude Code / Codex) was terminated by the user
-  // without calling room_leave, so the participant row stays in the room
-  // forever. The "Disconnected" label is a hint to the host that this
-  // participant is unlikely to come back, paired with the always-visible
-  // kick button so they can clean up in one click.
-  if (now - p.lastSeenAt > PRESENCE_DISCONNECTED_MS) {
-    return {
-      kind: 'disconnected' as const,
-      label: 'Disconnected',
-      detail: p.client === 'cc' ? 'host can remove' : '',
-      className: 'text-ink-faint',
-      dotClassName: 'bg-slate-400',
-    };
-  }
-
-  return {
-    kind: 'idle' as const,
-    label: 'Idle',
-    detail: p.client === 'cc' ? 'not listening' : '',
-    className: 'text-ink-faint',
-    dotClassName: 'bg-slate-300',
-  };
 }

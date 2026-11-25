@@ -4,7 +4,7 @@
 // categories) — those are cross-room and written at room end.
 
 import type { ClientKind, Message, MessageAttachment, MessageKind } from './types.js';
-import { safeAttachmentPromptText } from './security.js';
+import { EXECUTABLE_ATTACHMENT_WARNING, isExecutableAttachment, safeAttachmentPromptText } from './security.js';
 
 export const ROOM_RECENT_LIMIT = 16;
 export const ROOM_DIGEST_MAX_CHARS = 1200;
@@ -21,6 +21,7 @@ export interface SlimAttachment {
   height?: number;
   previewUrl?: string;
   extractedText?: string;
+  safetyWarning?: string;
 }
 
 export interface SlimRoomMessage {
@@ -44,7 +45,8 @@ const MARKER_RE = /\[(DECISION|TODO|RESULT|STATUS|BLOCKED|DONE)\]/i;
 const MARKER_SPLIT_RE = /(?=\[(?:DECISION|TODO|RESULT|STATUS|BLOCKED|DONE)\])/i;
 
 export function slimAttachment(a: MessageAttachment): SlimAttachment {
-  const extractedText = safeAttachmentPromptText(a.name, a.mime, a.extractedText);
+  const executable = isExecutableAttachment(a);
+  const extractedText = executable ? undefined : safeAttachmentPromptText(a.name, a.mime, a.extractedText);
   return {
     id: a.id,
     type: a.type,
@@ -54,7 +56,8 @@ export function slimAttachment(a: MessageAttachment): SlimAttachment {
     mime: a.mime,
     ...(typeof a.width === 'number' ? { width: a.width } : {}),
     ...(typeof a.height === 'number' ? { height: a.height } : {}),
-    ...(a.previewUrl ? { previewUrl: a.previewUrl } : {}),
+    ...(a.previewUrl && !executable ? { previewUrl: a.previewUrl } : {}),
+    ...(executable ? { safetyWarning: EXECUTABLE_ATTACHMENT_WARNING } : {}),
     ...(extractedText ? { extractedText } : {}),
   };
 }

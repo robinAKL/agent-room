@@ -37,7 +37,8 @@ const client = { post } as never;
 const task = async (args: Record<string, unknown>) => {
   const { callTool } = await import('./_mcpTools.js');
   await callTool(client, 'full', 'room_task', { code: room.code, name: 'Codex', ...args });
-  return post.mock.calls[0]![0] as Record<string, unknown>;
+  // The first post can be the caller's presence refresh; the task write is the other one.
+  return post.mock.calls.map(call => call[0] as Record<string, unknown>).find(body => body.action !== 'presence')!;
 };
 
 describe('room_task role client kinds', () => {

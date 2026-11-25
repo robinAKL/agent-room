@@ -1,6 +1,7 @@
+import { ROOM_ACTIVE_BACKSTOP_MS, ROOM_RETENTION_GRACE_MS } from '@agent-room/shared';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AVATAR_PALETTE, type Room } from '@agent-room/shared';
-import { createClient, createRoom, getRoom, RoomNotFoundError, casRoom, ConcurrencyError, joinRoom, InterviewRoomBusyError } from '../src/index.js';
+import { createClient, createRoom, getRoom, RoomNotFoundError, casRoom, ConcurrencyError, joinRoom, InterviewRoomBusyError, endRoom, reactivateRoom } from '../src/index.js';
 
 const ENV = { url: 'https://example.upstash.io', token: 't' };
 
@@ -11,7 +12,7 @@ function mockResp(body: unknown) {
 describe('createRoom', () => {
   beforeEach(() => vi.restoreAllMocks());
 
-  it('stores a room JSON under the given code with 24h TTL', async () => {
+  it('stores a room JSON under the given code with the active-room backstop deadline', async () => {
     const fetchMock = vi.fn().mockResolvedValue(mockResp({ result: 'OK' }));
     vi.stubGlobal('fetch', fetchMock);
 
@@ -39,8 +40,40 @@ describe('createRoom', () => {
     expect(stored.ownerId).toBe('user_123');
     expect(stored.ownerEmail).toBe('alex@example.com');
     expect(stored.ownerName).toBe('Alex Host');
-    expect(cmd).toContain('EX');
-    expect(cmd).toContain(86400);
+    // Retention starts at end (#714); an active room only carries a backstop.
+    expect(cmd[3]).toBe('EXAT');
+    expect(cmd[4]).toBe(Math.floor((stored.createdAt + ROOM_ACTIVE_BACKSTOP_MS) / 1000));
+  });
+});
+
+describe('room retention after end', () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it('expires every room key a day after the end, and returns to the backstop on reopen', async () => {
+    const calls: unknown[][] = [];
+    let stored = JSON.stringify({ code: 'ABC-DEF-GHJ', topic: 't', createdAt: 1_000, createdBy: 'h', status: 'active', version: 1, participants: [] });
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init: { body: string }) => {
+      const body = JSON.parse(init.body);
+      const run = (cmd: unknown[]) => {
+        calls.push(cmd);
+        if (cmd[0] === 'GET') return stored;
+        if (cmd[0] === 'SET') { stored = String(cmd[2]); return 'OK'; }
+        return 1;
+      };
+      const result = String(url).endsWith('/pipeline') ? (body as unknown[][]).map(c => ({ result: run(c) })) : { result: run(body) };
+      return mockResp(result);
+    }));
+    const client = createClient(ENV);
+    const ended = await endRoom(client, 'ABC-DEF-GHJ');
+    const endExpiry = calls.filter(c => c[0] === 'EXPIREAT');
+    expect(endExpiry.map(c => c[1])).toEqual(expect.arrayContaining([
+      'room:ABC-DEF-GHJ', 'room-msgs:ABC-DEF-GHJ', 'room-msg-count:ABC-DEF-GHJ', 'task-board:ABC-DEF-GHJ', 'turn-state:ABC-DEF-GHJ', 'room-webhooks:ABC-DEF-GHJ',
+    ]));
+    expect(new Set(endExpiry.map(c => c[2]))).toEqual(new Set([Math.floor((ended.endedAt! + ROOM_RETENTION_GRACE_MS) / 1000)]));
+    calls.length = 0;
+    const reopened = await reactivateRoom(client, 'ABC-DEF-GHJ');
+    const reopenExpiry = calls.filter(c => c[0] === 'EXPIREAT');
+    expect(new Set(reopenExpiry.map(c => c[2]))).toEqual(new Set([Math.floor((reopened.reactivatedAt! + ROOM_ACTIVE_BACKSTOP_MS) / 1000)]));
   });
 });
 
