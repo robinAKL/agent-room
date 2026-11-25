@@ -13,7 +13,8 @@
 // low-stakes enough that we accept the (tiny) lost-update window instead of
 // pulling in a CAS loop.
 
-import { ROOM_TTL_SECONDS } from '@agent-room/shared';
+import type { Room } from '@agent-room/shared';
+import { roomExpireAtSeconds } from '@agent-room/shared';
 import type { UpstashClient } from './client.js';
 import { getRoom } from './rooms.js';
 
@@ -55,11 +56,10 @@ export async function saveRoomWebhooks(
   client: UpstashClient,
   code: string,
   hooks: RoomWebhook[],
-  roomCreatedAt: number,
+  room: Pick<Room, 'status' | 'createdAt' | 'endedAt' | 'reactivatedAt'> | number,
 ): Promise<void> {
-  const expireAt =
-    (Number.isFinite(roomCreatedAt) ? Math.floor(roomCreatedAt / 1000) : Math.floor(Date.now() / 1000)) +
-    ROOM_TTL_SECONDS;
+  // A bare number is the legacy roomCreatedAt argument: an active room.
+  const expireAt = roomExpireAtSeconds(typeof room === 'number' ? { status: 'active', createdAt: room } : room);
   await client.pipeline([
     ['SET', webhooksKey(code), JSON.stringify(hooks)],
     ['EXPIREAT', webhooksKey(code), expireAt],
@@ -98,7 +98,7 @@ export async function registerRoomWebhook(
     existing.registeredBy = input.registeredBy;
     existing.secret = input.secret;
     existing.failCount = 0;
-    await saveRoomWebhooks(client, code, hooks, room.createdAt);
+    await saveRoomWebhooks(client, code, hooks, room);
     return existing;
   }
   if (hooks.length >= MAX_WEBHOOKS_PER_ROOM) throw new WebhookLimitError();
@@ -110,7 +110,7 @@ export async function registerRoomWebhook(
     createdAt: Date.now(),
   };
   hooks.push(hook);
-  await saveRoomWebhooks(client, code, hooks, room.createdAt);
+  await saveRoomWebhooks(client, code, hooks, room);
   return hook;
 }
 
@@ -124,6 +124,6 @@ export async function unregisterRoomWebhook(
   const hooks = await listRoomWebhooks(client, code);
   const next = hooks.filter(h => h.id !== idOrUrl && h.url !== idOrUrl);
   if (next.length === hooks.length) return false;
-  await saveRoomWebhooks(client, code, next, room.createdAt);
+  await saveRoomWebhooks(client, code, next, room);
   return true;
 }

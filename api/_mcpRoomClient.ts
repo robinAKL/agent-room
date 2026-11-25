@@ -23,6 +23,7 @@
 import { generateCode } from '@agent-room/shared';
 import type { Message, Participant, Room, RoomReport } from '@agent-room/shared';
 import {
+  casRoom,
   createClient,
   createRoom as storeCreateRoom,
   createRoomReport as storeCreateRoomReport,
@@ -76,6 +77,8 @@ import {
 } from '@agent-room/upstash-client';
 import type { UpstashClient } from '@agent-room/upstash-client';
 import { dispatchRoomWebhooks, validateWebhookUrl } from './_webhookDispatch.js';
+import { AttachmentStorageError } from './_roomAttachmentStorage.js';
+import { resolveRoomUploads, roomUploadsKey, uploadRoomFile } from './_roomAgentUploads.js';
 
 /** Same shape the hosted deployment's client throws, so the tool layer's
  *  error handling is identical on both. */
@@ -270,6 +273,27 @@ async function dispatchAction(store: UpstashClient, p: Record<string, unknown>):
         return { capabilities: me?.capabilities, ...(board ? { board } : {}) };
       }
 
+      // ── presence from working calls ─────────────────────────────────────
+      case 'presence': {
+        // lastSeenAt only, for the named agent seat; never a listen lease.
+        const at = typeof p.at === 'number' && Number.isFinite(p.at) ? Math.min(p.at, Date.now()) : Date.now();
+        await casRoom(store, code, room => ({
+          ...room,
+          participants: room.participants.map(seat => seat.client === 'cc' && seat.name === str(p.name)
+            ? { ...seat, lastSeenAt: Math.max(seat.lastSeenAt ?? 0, at) } : seat),
+        }));
+        return { ok: true };
+      }
+
+      // ── agent file uploads ──────────────────────────────────────────────
+      case 'upload': {
+        const room = await storeGetRoom(store, code);
+        return await uploadRoomFile(store, room, {
+          name: p.name, seatKey: p.seatKey, operation: p.operation, filename: p.filename,
+          mime: p.mime, encoding: p.encoding, content: p.content,
+        });
+      }
+
       // ── resident webhooks ───────────────────────────────────────────────
       case 'webhookSet': {
         // upstash-client's registerRoomWebhook accepts any string. That is
@@ -338,6 +362,7 @@ async function dispatchAction(store: UpstashClient, p: Record<string, unknown>):
     }
   } catch (e) {
     if (e instanceof TaskExecutionError) throw new RemoteRoomApiError(e.message, 409, `task_execution_${e.code}`);
+    if (e instanceof AttachmentStorageError) throw new RemoteRoomApiError(e.message, e.status, e.name);
     if (e instanceof SeatProofError) throw new RemoteRoomApiError(e.message, 403, 'task_execution_identity_required');
     if (e instanceof WebhookLimitError) throw new RemoteRoomApiError(e.message, 409, 'WebhookLimitError');
     if (e instanceof NotParticipantError) throw new RemoteRoomApiError(e.message, 403, 'NotParticipantError');
@@ -469,8 +494,35 @@ export async function appendMessage(
   code: string,
   message: Message,
   kind: 'message' | 'status' = 'message',
+  upload?: { attachmentIds: unknown; seatKey?: string },
 ): Promise<unknown> {
+  let publicationId: string | undefined;
+  if (upload) {
+    // Files an agent uploaded with room_upload become part of this message.
+    // The same seat publishing the same set with the same text again is a
+    // duplicate, not a second post (an agent retrying after a timeout).
+    try {
+      const room = await storeGetRoom(client.store, code);
+      const resolved = await resolveRoomUploads(client.store, room, message.name, upload.attachmentIds, upload.seatKey,
+        message.text ?? '', kind);
+      const previous = await client.store.command<string | null>(['HGET', roomUploadsKey(code), resolved.publicationId]);
+      if (previous) return { appended: true, duplicate: true, metadata: JSON.parse(previous) };
+      message = { ...message, attachments: resolved.attachments };
+      publicationId = resolved.publicationId;
+    } catch (e) {
+      if (e instanceof AttachmentStorageError) throw new RemoteRoomApiError(e.message, e.status, e.name);
+      return translate(e);
+    }
+  }
   const result = await guarded(() => storeAppendMessage(client.store, code, message, kind));
+  if (publicationId) {
+    try {
+      await client.store.pipeline([
+        ['HSET', roomUploadsKey(code), publicationId, JSON.stringify((result as { metadata?: unknown }).metadata ?? {})],
+        ['EXPIRE', roomUploadsKey(code), 24 * 60 * 60],
+      ]);
+    } catch { /* dedupe bookkeeping only */ }
+  }
   // Fan out to resident webhooks. The hosted server does this from its send
   // path; storage does not do it for us, so without this a registered webhook
   // would be a row in Redis that never fires — a tool that appears to work and

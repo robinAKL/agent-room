@@ -1,4 +1,4 @@
-import type { MessageAttachment } from '@agent-room/shared';
+import { ALLOWED_ATTACHMENT_MIMES, resolveAttachmentMime, type MessageAttachment } from '@agent-room/shared';
 
 // Tunables — kept in sync with api/upload.ts on the server side. The server
 // re-validates anyway; these constants exist for client-side preflight (so
@@ -6,24 +6,10 @@ import type { MessageAttachment } from '@agent-room/shared';
 export const MAX_ATTACHMENTS_PER_MESSAGE = 5;
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
 
-export const ALLOWED_ATTACHMENT_TYPES = new Set([
-  'image/png',
-  'image/jpeg',
-  'image/jpg',
-  'image/webp',
-  'image/gif',
-  'image/svg+xml',
-  'application/pdf',
-  'text/plain',
-  'text/markdown',
-  'text/html',
-  'application/json',
-  'text/csv',
-  'application/zip',
-  'application/vnd.ms-excel',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-]);
+// Known formats keep their MIME for previews and text extraction; any other
+// file is still shared, as a binary download (the server decides, and labels
+// executables with a warning). Used for pasted-image recovery below.
+export const ALLOWED_ATTACHMENT_TYPES = ALLOWED_ATTACHMENT_MIMES;
 
 export class UploadError extends Error {
   code: string;
@@ -47,8 +33,13 @@ export async function uploadAttachment(
   file: File,
   roomCode: string,
 ): Promise<MessageAttachment> {
-  if (!ALLOWED_ATTACHMENT_TYPES.has(file.type)) {
-    throw new UploadError('mime_not_allowed', 415, `Unsupported file type: ${file.type || file.name}`);
+  // file.type is empty or a vendor alias on some OSes (.xlsx on Windows
+  // without Office). Resolve by extension and re-wrap the File so the
+  // multipart part carries the canonical type; the server re-resolves anyway.
+  const original = file;
+  const mime = resolveAttachmentMime(original.name, original.type);
+  if (mime !== original.type && mime !== 'application/octet-stream') {
+    file = new File([original], original.name, { type: mime, lastModified: original.lastModified });
   }
   if (file.size === 0) {
     throw new UploadError('empty_file', 400, `${file.name} is empty.`);

@@ -4,12 +4,26 @@ import type {
   ReplyMode,
   ReplyModeConfig,
 } from '@agent-room/shared';
-import { AVATAR_PALETTE, DEFAULT_TURN_TIMEOUTS_MS, PRESENCE_DISCONNECTED_MS, ROOM_TTL_SECONDS, participantMemberId } from '@agent-room/shared';
+import { AVATAR_PALETTE, DEFAULT_TURN_TIMEOUTS_MS, PRESENCE_DISCONNECTED_MS, participantMemberId, roomExpireAtSeconds } from '@agent-room/shared';
 import type { UpstashClient } from './client.js';
 import { sha256Hex } from './sha256.js';
 import { RoomNotFoundError, ConcurrencyError } from './errors.js';
 
 function roomKey(code: string): string { return `room:${code}`; }
+
+/** Every key that belongs to one room and shares its retention deadline. */
+export function roomScopedKeys(code: string): string[] {
+  return [
+    roomKey(code), `room-msgs:${code}`, `room-msg-count:${code}`, `turn-state:${code}`,
+    `task-board:${code}`, `room-webhooks:${code}`, `room-uploads:${code}`,
+  ];
+}
+
+/** Stamp the room's current deadline (see roomRetention.ts) on all its keys. */
+async function applyRoomRetention(client: UpstashClient, room: Room): Promise<void> {
+  const expireAt = roomExpireAtSeconds(room);
+  await client.pipeline(roomScopedKeys(room.code).map(key => ['EXPIREAT', key, expireAt]));
+}
 
 // 32 hex chars (~128 bits). Stored on the host's sessionStorage; only the
 // SHA-256 hash of this key lands on the server (`Room.hostKeyHash`) so a
@@ -86,7 +100,9 @@ export async function createRoom(client: UpstashClient, input: CreateRoomInput):
     projectPromptVersion: input.projectPromptVersion,
     projectPromptUpdatedAt: input.projectPromptUpdatedAt,
   };
-  await client.command(['SET', roomKey(input.code), JSON.stringify(room), 'EX', ROOM_TTL_SECONDS]);
+  // An active room's deadline is a week from now (a backstop: nothing sweeps
+  // abandoned rooms here); endRoom replaces it with end + 24h.
+  await client.command(['SET', roomKey(input.code), JSON.stringify(room), 'EXAT', roomExpireAtSeconds(room)]);
   return { ...room, hostKey };
 }
 
@@ -120,9 +136,8 @@ export async function casRoom(
     // window is acceptable here because the only mutable field is `participants`, and messages
     // (the hot path) use atomic RPUSH. Version bumps make drift visible if it ever matters.
     next.version = current.version + 1;
-    // KEEPTTL preserves the 24h deadline createRoom set, so a room is a hard
-    // cap from creation — activity (joins, presence heartbeats) no longer
-    // slides the expiry forward, which is what kept rooms alive past 24h.
+    // KEEPTTL preserves the deadline createRoom / endRoom / reactivateRoom set,
+    // so activity (joins, presence heartbeats) never slides it forward.
     await client.command(['SET', roomKey(code), JSON.stringify(next), 'KEEPTTL']);
     return next;
   }
@@ -693,23 +708,29 @@ export async function endRoom(
   client: UpstashClient,
   code: string,
 ): Promise<Room> {
-  return casRoom(client, code, (current) => ({
+  const ended = await casRoom(client, code, (current) => ({
     ...current,
     status: 'ended' as const,
-    endedAt: Date.now(),
+    endedAt: current.status === 'ended' && current.endedAt ? current.endedAt : Date.now(),
   }));
+  // Retention starts now: every room key expires a day after the end.
+  await applyRoomRetention(client, ended);
+  return ended;
 }
 
 export async function reactivateRoom(
   client: UpstashClient,
   code: string,
 ): Promise<Room> {
-  return casRoom(client, code, (current) => ({
+  const room = await casRoom(client, code, (current) => ({
     ...current,
     status: 'active' as const,
     endedAt: undefined,
     reactivatedAt: Date.now(),
   }));
+  // Back to an active room's deadline, counted from the reopen.
+  await applyRoomRetention(client, room);
+  return room;
 }
 
 export async function updatePresence(

@@ -139,6 +139,7 @@ export type SystemEventType =
   | 'login_nudge'
   | 'moderator_handoff'  // moderator timed out / left — floor handed to a deputy
   | 'task_update'        // evidence-gated task board changed state
+  | 'attachment_warning'
   | 'project_prompt_updated'; // host set/cleared the room's project prompt
 
 // Default per-role timeout values (in ms). Used when a room hasn't been
@@ -348,6 +349,12 @@ export interface MessageAttachment {
   size: number;
   mime: string;
   uploadedAt: number;
+  /** Origin and server-side safety state. Uploads are never executed automatically. */
+  provenance?: 'user_upload' | 'agent_generated' | 'system';
+  /** SHA-256 of the bytes the server stored. */
+  sha256?: string;
+  scanStatus?: 'pending' | 'sanitized' | 'blocked';
+  riskClass?: 'low' | 'sensitive' | 'executable' | 'archive';
   width?: number;
   height?: number;
   /** Server-extracted text content of the file (PDF / txt / md / csv / …),

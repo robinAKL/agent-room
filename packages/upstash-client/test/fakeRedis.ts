@@ -6,7 +6,7 @@
 // behavioural model of those scripts, not Redis: it does not execute Lua.
 import { vi } from 'vitest';
 
-type Value = string | string[] | Set<string>;
+type Value = string | string[] | Set<string> | Map<string, string>;
 
 export interface FakeRedis {
   store: Map<string, Value>;
@@ -120,6 +120,13 @@ function run(fake: FakeRedis, cmd: unknown[]): unknown {
     }
     case 'SREM': { const s = store.get(key); if (s instanceof Set) cmd.slice(2).forEach(v => s.delete(String(v))); return 1; }
     case 'SMEMBERS': { const s = store.get(key); return s instanceof Set ? [...s] : []; }
+    case 'HSET': {
+      const h = store.get(key) instanceof Map ? store.get(key) as Map<string, string> : new Map<string, string>();
+      for (let i = 2; i + 1 < cmd.length; i += 2) h.set(String(cmd[i]), String(cmd[i + 1]));
+      store.set(key, h);
+      return 1;
+    }
+    case 'HGET': { const h = store.get(key); return h instanceof Map ? h.get(String(cmd[2])) ?? null : null; }
     case 'EXPIRE': case 'EXPIREAT': case 'PEXPIRE': return 1;
     case 'EVAL': {
       const script = String(cmd[1]);

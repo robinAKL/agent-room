@@ -1,5 +1,5 @@
 import type { Message, MessageMetadata, RoleInTurn, InvocationType, Room, TaskBoard } from '@agent-room/shared';
-import { MAX_MESSAGES_PER_ROOM, ROOM_TTL_SECONDS, recordTaskNotificationPublished, sessionStartedAt } from '@agent-room/shared';
+import { MAX_MESSAGES_PER_ROOM, recordTaskNotificationPublished, roomExpireAtSeconds, sessionStartedAt } from '@agent-room/shared';
 import type { UpstashClient } from './client.js';
 import { findSpeaker, MutedError, NotYourTurnError, getRoom } from './rooms.js';
 import type { TurnSpokenEntry } from './turnState.js';
@@ -115,7 +115,7 @@ export async function appendMessage(
       invocationType: message.metadata?.invocationType ?? 'normal_turn',
     };
     const enriched: Message = { ...message, metadata };
-    await rpushMessage(client, code, enriched, room.createdAt);
+    await rpushMessage(client, code, enriched, room);
     return { appended: true, metadata };
   }
 
@@ -295,7 +295,7 @@ export async function appendMessage(
     ...(decision.extendsTurn ? { extendsTurn: true } : {}),
   };
   const enriched: Message = { ...message, metadata };
-  await rpushMessage(client, code, enriched, room.createdAt);
+  await rpushMessage(client, code, enriched, room);
   return {
     appended: true,
     metadata,
@@ -304,19 +304,20 @@ export async function appendMessage(
 }
 
 // Internal helper: write a message to the Redis list, pinning TTL to the
-// room's hard 24h deadline and keeping the absolute-count counter in lockstep.
+// room's retention deadline and keeping the absolute-count counter in lockstep.
 // INCR on the count key MUST sit in the same pipeline as RPUSH so the count
 // stays in lock-step with the list — listMessages relies on the invariant
 // `totalCount - listLen = number of LTRIMmed entries` to compensate cursors.
-// EXPIREAT (a fixed creation+TTL deadline) rather than EXPIRE means the
-// message list dies exactly when the room does, instead of sliding forward.
+// EXPIREAT (the room's absolute deadline, see roomRetention.ts) rather than
+// EXPIRE means the message list dies exactly when the room does, instead of
+// sliding forward.
 async function rpushMessage(
   client: UpstashClient,
   code: string,
   message: Message,
-  roomCreatedAt: number,
+  room: Pick<Room, 'status' | 'createdAt' | 'endedAt' | 'reactivatedAt'>,
 ): Promise<void> {
-  const expireAt = (Number.isFinite(roomCreatedAt) ? Math.floor(roomCreatedAt / 1000) : Math.floor(Date.now() / 1000)) + ROOM_TTL_SECONDS;
+  const expireAt = roomExpireAtSeconds(room);
   // Older MCP clients (and raw API callers) can send a message with no
   // `text` — persisting it verbatim crashed every web viewer of the room
   // ("Cannot read properties of undefined (reading 'length')" in Bubble
@@ -344,7 +345,7 @@ export async function appendSystemMessage(
   message: Message
 ): Promise<void> {
   const room = await getRoom(client, code); // throws RoomNotFoundError if the room is gone
-  await rpushMessage(client, code, message, room.createdAt);
+  await rpushMessage(client, code, message, room);
 }
 
 // Claim, append and acknowledge one task notification in the SAME script.
@@ -412,7 +413,7 @@ export async function publishTaskNotifications(client: UpstashClient, code: stri
   const pending = board.tasks.filter(t => t.notification && t.notification.deliveredAt === undefined);
   if (!pending.length) return 0;
   const room = await getRoom(client, code);
-  const expireAt = (Number.isFinite(room.createdAt) ? Math.floor(room.createdAt / 1000) : Math.floor(Date.now() / 1000)) + ROOM_TTL_SECONDS;
+  const expireAt = roomExpireAtSeconds(room);
   let delivered = 0;
   for (const [index, task] of pending.entries()) {
     const notice = task.notification!;

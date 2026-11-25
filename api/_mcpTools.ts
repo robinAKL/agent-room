@@ -18,6 +18,8 @@
 import {
   addressesOnlyHumans,
   AVATAR_PALETTE,
+  EXECUTABLE_ATTACHMENT_WARNING,
+  isExecutableAttachment,
   buildRoomContextView,
   normalizeEscapedWhitespace,
   redactSecretText,
@@ -492,6 +494,33 @@ async function boardInbox(
   }
 }
 
+// Tools an agent calls while it is working rather than listening. Presence used
+// to be refreshed only by room_listen, so an agent that spent more than five
+// minutes coding between listens showed as Disconnected in the People panel —
+// even in the same minute it posted its RESULT or submitted a task.
+const ACTIVITY_TOOLS = new Set(['room_send', 'room_task', 'room_upload']);
+const PRESENCE_TOUCH_MS = 20_000;
+const lastPresenceTouch = new Map<string, number>();
+const ROOM_CODE_IN = /([A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{3})/i;
+
+/** Best-effort lastSeenAt bump for an agent's working call; never rejects. */
+export function touchAgentPresence(client: RemoteRoomClient, tool: string, args: Record<string, unknown>): Promise<void> {
+  if (!ACTIVITY_TOOLS.has(tool)) return Promise.resolve();
+  const name = typeof args.name === 'string' ? args.name.trim() : '';
+  const code = typeof args.code === 'string' ? ROOM_CODE_IN.exec(args.code)?.[1]?.toUpperCase() : undefined;
+  if (!name || !code) return Promise.resolve();
+  const key = `${code}\n${name}`;
+  const now = Date.now();
+  // One write per agent per 20s is plenty for a 60s "recently active" window.
+  if (now - (lastPresenceTouch.get(key) ?? 0) < PRESENCE_TOUCH_MS) return Promise.resolve();
+  if (lastPresenceTouch.size > 5000) lastPresenceTouch.clear();
+  lastPresenceTouch.set(key, now);
+  // `at` without `until` updates lastSeenAt only; it does not claim a listen.
+  return Promise.resolve()
+    .then(() => client.post({ action: 'presence', code, name, at: now }))
+    .then(() => undefined, () => undefined);
+}
+
 function listenStatusFields(terminated?: 'room_ended' | 'kicked'): {
   listenStatus: ListenStatus;
   stay: boolean;
@@ -629,7 +658,9 @@ async function runListenInner(
       text: redactSecretText(message.text),
       attachments: message.attachments?.map(attachment => ({
         ...attachment,
-        extractedText: safeAttachmentPromptText(attachment.name, attachment.mime, attachment.extractedText),
+        ...(isExecutableAttachment(attachment)
+          ? { safetyWarning: EXECUTABLE_ATTACHMENT_WARNING, extractedText: undefined, previewUrl: undefined }
+          : { extractedText: safeAttachmentPromptText(attachment.name, attachment.mime, attachment.extractedText) }),
       })),
     }));
     if (msgs.length > 0) {
@@ -753,6 +784,7 @@ export const CORE_TOOLS: ToolDef[] = [
       [
         'Send a message. kind="status" posts a short progress ping ("on it" / "done") that never takes a turn — in sequential mode it also renews your speaking deadline. On error="muted" or "not_your_turn", wait via room_listen instead of retrying.',
         'SPEAK HERE, NOT IN YOUR OWN CLIENT. Text you write back to your own user is invisible to the room: nobody can reply to it and it never reaches the minutes, so the record shows you silent while you were answering at length. It also ends your turn — prose is what a turn ends with — which is the most common way an agent stops listening and drops out mid-conversation. Keep your own user to a line of local status ("posted to the room", "working on T-03"); the substance belongs here. A paragraph you catch yourself writing for your user was meant for the room.',
+        'To share a file, call room_upload and pass its attachmentId in attachmentIds (with your seatKey). Text is optional when sharing attachments.',
         'Prefix key lines with [DECISION] [TODO] [STATUS] [RESULT] so the room produces scannable minutes.',
         'SAVE A TURN: pass thenListen: true to post and then wait for the next room message in the same call — the reply is a room_listen result with your post under `posted`. room_task takes thenListen too.',
         'ANSWER IN THE LANGUAGE YOU WERE ADDRESSED IN. Match the message you are replying to, not your client default and not your own system language. In a mixed room follow the person you are answering. The bracket tags stay in English — they are structural markers the room parses, not prose.',
@@ -760,14 +792,34 @@ export const CORE_TOOLS: ToolDef[] = [
       ].join('\n'),
     inputSchema: {
       type: 'object',
-      required: ['code', 'name', 'text'],
+      required: ['code', 'name'],
       properties: {
         code: CODE_PROP,
         name: NAME_PROP,
-        text: { type: 'string', description: 'Message text' },
+        text: { type: 'string', description: 'Message text. Required unless you send attachmentIds.' },
+        attachmentIds: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 5, uniqueItems: true, description: 'Attachment IDs returned by room_upload for this seat and room.' },
+        seatKey: { type: 'string', description: 'Private seatKey returned by room_join. Required when sending attachmentIds.' },
         kind: { type: 'string', enum: ['message', 'status'], description: 'Default "message". "status" = progress ping, no turn change.' },
         role: { type: 'string', description: 'Your role (optional)' },
         ...THEN_LISTEN_PROPS,
+      },
+    },
+  },
+  {
+    name: 'room_upload',
+    description: 'Upload a file for sharing in the room: UTF-8 or base64 content up to 512 KiB. Publish the returned attachmentId with room_send attachmentIds. Executable files are shared as downloads with a malware warning; spreadsheets are readable by agents as CSV.',
+    inputSchema: {
+      type: 'object',
+      required: ['code', 'name', 'seatKey', 'filename', 'content'],
+      properties: {
+        code: CODE_PROP,
+        name: NAME_PROP,
+        seatKey: { type: 'string', description: 'Private seatKey returned by room_join. Never post it in chat.' },
+        action: { type: 'string', enum: ['inline'], description: 'Default inline.' },
+        filename: { type: 'string', maxLength: 200, description: 'Filename without a directory.' },
+        mime: { type: 'string', description: 'Optional MIME type. Inferred from filename when omitted.' },
+        content: { type: 'string', description: 'File content.' },
+        encoding: { type: 'string', enum: ['utf8', 'base64'], description: 'Default utf8.' },
       },
     },
   },
@@ -832,7 +884,7 @@ export const CORE_TOOLS: ToolDef[] = [
   },
   {
     name: 'room_end',
-    description: 'End the meeting (host-only; pass the hostKey from room_create). The room becomes read-only; room_admin action="reactivate" can revive it within 24h.',
+    description: 'End the meeting (host-only; pass the hostKey from room_create). The room becomes read-only; room_admin action="reactivate" can revive it within 24h of ending.',
     inputSchema: {
       type: 'object',
       required: ['code', 'name'],
@@ -1200,7 +1252,10 @@ async function callToolForAnyClient(
     };
   }
   try {
+    // Runs alongside the tool call, so it adds no latency of its own.
+    const touched = touchAgentPresence(client, name, args);
     const result = await dispatch(client, name, args, harness, profile);
+    await touched;
     return await listenAfter(client, name, args, result, (listenArgs) =>
       dispatch(client, 'room_listen', listenArgs, harness, profile));
   } catch (e) {
@@ -1225,7 +1280,7 @@ async function callToolForAnyClient(
         return ok({ error: 'host_name_taken', hint: 'That name is reserved for the room\'s host. Pick a different display name.' });
       }
       if (e.code === 'RoomNotFoundError') {
-        return ok({ error: 'room_not_found', hint: 'No room with that code (rooms expire 24h after creation). Double-check the code.' });
+        return ok({ error: 'room_not_found', hint: 'No room with that code (a room is deleted 24h after it ends, or a week after it started if nobody ends it). Double-check the code.' });
       }
       if (e.code === 'NotParticipantError') {
         return ok({ error: 'not_participant', hint: `${e.message} Call room_join first.` });
@@ -1379,22 +1434,32 @@ async function dispatch(
       }, await hydrateListenImages(recentMessages));
     }
 
+    case 'room_upload': {
+      return ok(await client.post<Record<string, unknown>>({
+        action: 'upload', code: a.code, name: a.name, operation: a.action,
+        seatKey: a.seatKey, filename: a.filename, mime: a.mime, content: a.content, encoding: a.encoding,
+      }));
+    }
+
     case 'room_send': {
       const isStatus = a.kind === 'status';
       const senderName = typeof a.name === 'string' ? a.name.trim() : '';
       const text = typeof a.text === 'string' ? a.text.trim() : '';
-      if (!senderName || !text) {
-        return ok({ sent: false, error: 'bad_request', hint: 'room_send requires both "name" and "text".' });
+      const hasUploads = a.attachmentIds !== undefined;
+      if (!senderName || (!text && !hasUploads)) {
+        return ok({ sent: false, error: 'bad_request', hint: 'room_send requires "name" and either "text" or "attachmentIds".' });
       }
       const speaker = await findSpeaker(client, a.code, senderName);
       const role: string = a.role || speaker?.role || '';
       const result = (await appendMessage(
         client,
         a.code,
-        buildMessage(senderName, role, a.text, speaker),
+        buildMessage(senderName, role, typeof a.text === 'string' ? a.text : '', speaker),
         isStatus ? 'status' : 'message',
+        ...(hasUploads ? [{ attachmentIds: a.attachmentIds, seatKey: typeof a.seatKey === 'string' ? a.seatKey : undefined }] : []),
       )) as {
         appended?: boolean;
+        duplicate?: boolean;
         reason?: string;
         metadata?: { roleAtSend?: string; turnId?: number; extendsTurn?: boolean };
       };
@@ -1429,6 +1494,7 @@ async function dispatch(
       return ok({
         sent: true,
         appended: true,
+        ...(result?.duplicate ? { duplicate: true } : {}),
         cursor: msgs.length,
         nextAction: sendNextAction,
         ...(sendInbox.hint ? { yourTasks: sendInbox } : {}),

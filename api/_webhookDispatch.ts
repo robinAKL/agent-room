@@ -184,7 +184,7 @@ export async function dispatchRoomWebhooks(
   }
   if (changed) {
     try {
-      await saveRoomWebhooks(client, room.code, survivors, room.createdAt);
+      await saveRoomWebhooks(client, room.code, survivors, room);
     } catch { /* bookkeeping only */ }
   }
 }

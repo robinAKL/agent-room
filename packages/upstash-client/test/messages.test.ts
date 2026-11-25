@@ -1,3 +1,4 @@
+import { ROOM_ACTIVE_BACKSTOP_MS } from '@agent-room/shared';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Message, Room } from '@agent-room/shared';
 import { MAX_MESSAGES_PER_ROOM, ROOM_TTL_SECONDS } from '@agent-room/shared';
@@ -57,14 +58,14 @@ describe('appendMessage', () => {
     expect(cmds[2][0]).toBe('LTRIM');
     expect(cmds[2][2]).toBe(-MAX_MESSAGES_PER_ROOM);
     expect(cmds[2][3]).toBe(-1);
-    // EXPIREAT pins both keys to a fixed deadline (room.createdAt + TTL).
-    // APPROVED_ROOM.createdAt is 0, so the deadline is exactly ROOM_TTL_SECONDS.
+    // EXPIREAT pins both keys to the room's fixed deadline (roomRetention.ts):
+    // an active room's backstop, a week after createdAt (0 here).
     expect(cmds[3][0]).toBe('EXPIREAT');
     expect(cmds[3][1]).toBe('room-msgs:ABC-DEF-GHJ');
-    expect(cmds[3][2]).toBe(ROOM_TTL_SECONDS);
+    expect(cmds[3][2]).toBe(ROOM_ACTIVE_BACKSTOP_MS / 1000);
     expect(cmds[4][0]).toBe('EXPIREAT');
     expect(cmds[4][1]).toBe('room-msg-count:ABC-DEF-GHJ');
-    expect(cmds[4][2]).toBe(ROOM_TTL_SECONDS);
+    expect(cmds[4][2]).toBe(ROOM_ACTIVE_BACKSTOP_MS / 1000);
   });
 
   it('coerces a missing text field to "" before persisting', async () => {

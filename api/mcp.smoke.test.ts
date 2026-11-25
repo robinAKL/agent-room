@@ -134,13 +134,13 @@ function parsed(r: { content?: unknown }): Record<string, any> {
 }
 
 describe('hosted MCP endpoint', () => {
-  it('serves the ten-tool surface, without the hosted-only two', async () => {
+  it('serves the eleven-tool surface, without the hosted-only two', async () => {
     const mcp = await connect();
     const tools = (await mcp.listTools()).tools.map(t => t.name);
 
-    expect(tools).toHaveLength(10);
+    expect(tools).toHaveLength(11);
     for (const name of [
-      'room_create', 'room_join', 'room_send', 'room_listen', 'room_minutes',
+      'room_create', 'room_join', 'room_send', 'room_upload', 'room_listen', 'room_minutes',
       'room_leave', 'room_end', 'room_task', 'room_admin', 'room_webhook',
     ]) {
       expect(tools).toContain(name);

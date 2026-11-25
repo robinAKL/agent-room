@@ -122,3 +122,44 @@ Left out:
   `docs/integrations/PRESENCE.md` changes (#746, #754, #757): none of those
   files exist here.
 - Server-derived seat origins and relay detection (#753).
+
+## November 2026: uploads, presence and the web room (group C)
+
+Builds on groups B and A above.
+
+| Commercial | What landed here |
+|---|---|
+| `eebf15a0` (#758) | `room_upload` MCP tool, inline UTF-8/base64 up to 512 KiB, bound to the uploading seat's seatKey and room session; `room_send attachmentIds` publishes it, and a repeat of the same publication is answered as a duplicate. A per-room abuse ceiling of 60 MCP uploads a day applies. |
+| `98e0a4a1` (#745) | any file type can be shared: known formats keep their MIME, everything else is a binary download, and executables (by extension, MIME, macro-enabled Office types or byte signature) carry a malware warning, get no text projection or preview, and have no Open button on the web |
+| `f0ef5fb4` (#734) | `.xlsx` with a missing or vendor MIME is resolved by extension; `.xlsm` is stored as a macro-free `.xlsx`; agents get each sheet as CSV (`api/_spreadsheetText.ts`) |
+| `3fd1a4a0` (#809) | `room_send` / `room_task` / `room_upload` refresh the caller's `lastSeenAt` (throttled to once per 20s); an agent holding an in-progress task shows as Working for up to 30 minutes of silence |
+| `09805301` (#810) | host-only "Copy resume prompt" on agent seats that stopped listening, in the existing People panel |
+| `4a82f0c1` (#776) | `Bubble` is memoized and the room's artifact and roster work is memoized, so a composer keystroke does not re-render every message |
+| `f65be410` (#714) | ending a room sets every room key to expire 24 hours after the end; reopening resets it |
+
+Adapted:
+
+- Zip handling for workbooks uses a small `node:zlib` reader/writer
+  (`api/_zip.ts`) instead of adding `jszip`; its output is checked by the
+  ported spreadsheet tests and readable by Python's `zipfile`.
+- `api/upload.ts` and `room_upload` share `api/_roomAttachmentStorage.ts`.
+  Text is extracted for spreadsheets and text/JSON files only: this repository
+  ships no PDF or DOCX parser.
+- Retention: the hosted deployment removes an active room's TTL and relies on
+  a silence sweep to end abandoned rooms. There is no sweep here, so an active
+  room keeps a backstop deadline of 7 days from when it started or was last
+  reopened (`ROOM_ACTIVE_BACKSTOP_MS`), replaced by end + 24h when it ends. A
+  room record that carries its own `retentionSeconds` keeps it for the board.
+- Presence labels stay this repository's (Listening now / Online / Idle /
+  Disconnected); only the Working rule is added.
+
+Left out:
+
+- The Free/Pro upload quota (#774) and plan-based retention (`accountValidUntil`).
+- `room_upload` prepare/complete (presigned PUT up to 50 MiB) and the web's
+  direct-to-R2 path: this repository has no S3 presigner, and the web upload
+  limit stays 10 MB.
+- The commercial PeopleRail redesign; the resume prompt is added to the
+  existing People panel instead.
+- `packages/room-persistence` keeps its own TTL handling; it is the durable
+  kernel and was not part of this change.
