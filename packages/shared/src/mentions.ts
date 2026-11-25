@@ -54,6 +54,58 @@ function nameVariants(name: string): string[] {
 }
 
 /**
+ * Every participant name — agent or human — that `text` mentions as `@Name`,
+ * in roster order. Display names may contain spaces ("x t d"), so a mention is
+ * matched against the roster rather than cut at the first space.
+ *
+ * Longer names claim their span first: in a room with a human "x t d" and an
+ * agent "x", "@x t d hi" mentions only the human. Case-insensitive, like
+ * mentionedAgents.
+ */
+export function mentionedNames(text: string, names: readonly string[]): string[] {
+  if (!text) return [];
+  const unique = [...new Set(names.filter(name => name.trim()))];
+  let rest = text.toLowerCase();
+  const found = new Set<string>();
+  for (const name of [...unique].sort((a, b) => b.length - a.length)) {
+    const token = `@${name.toLowerCase()}`;
+    if (!rest.includes(token)) continue;
+    found.add(name);
+    rest = rest.split(token).join(' '.repeat(token.length));
+  }
+  return unique.filter(name => found.has(name));
+}
+
+/**
+ * Is this message aimed only at people? True when it @-mentions at least one
+ * human participant and no agent.
+ *
+ * Human speech normally wakes the room's agents (open mode broadcasts it, and
+ * an un-addressed host message wakes everyone). "@x t d can you check this"
+ * is one human talking to another: waking four agents to read it costs four
+ * turns and invites four replies nobody asked for. An agent mention anywhere
+ * in the text ("@x t d and @Claude") still counts as addressing that agent.
+ *
+ * Suffixed agent seats ("Claude (2)") also answer to their base name, so
+ * "@Claude" is never mistaken for a human-only message.
+ */
+export function addressesOnlyHumans(
+  text: string,
+  participants: readonly { name: string; client: string }[],
+): boolean {
+  if (!text || !hasMentionSyntax(text)) return false;
+  const agentNames = new Set<string>();
+  const humanNames = new Set<string>();
+  for (const p of participants) {
+    if (p.client === 'cc') nameVariants(p.name).forEach(v => agentNames.add(v));
+    else if (p.client === 'web') humanNames.add(p.name);
+  }
+  const mentioned = mentionedNames(text, [...agentNames, ...humanNames]);
+  return mentioned.some(name => humanNames.has(name) && !agentNames.has(name))
+    && !mentioned.some(name => agentNames.has(name));
+}
+
+/**
  * Should this message pull `selfName` out of a quiet room_listen?
  *
  * Presence is billed per turn: every early return from room_listen costs the

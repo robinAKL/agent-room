@@ -88,3 +88,37 @@ Verification: `packages/upstash-client/test/fakeRedis.ts` models the three task
 scripts in JavaScript for `taskReviewWait`, `taskExecution` and `taskTimeline`
 tests; `api/mcp.taskBoardFlow.test.ts` runs the real MCP tools end to end on it.
 The Lua scripts themselves are not executed by the test suite.
+
+## November 2026: MCP protocol and agent behaviour (group A)
+
+Builds on the task-board port above. Commercial sources, adapted rather than
+copied:
+
+| Commercial | What landed here |
+|---|---|
+| `1bc6a8b3` (#855) | `running_job` wait reason; a running-job wait keeps each listen to at most 60s and says to resume and submit when the command ends |
+| `ffbf1bda`, `1bd80541` (#853, #854) | `mentionedNames` / `addressesOnlyHumans` in `packages/shared`; a message that @-mentions only humans does not wake agents through the broadcast or sole-agent paths. Web: the composer picker lists everyone except the viewer, names with spaces work, and bubbles highlight roster names whole |
+| `d88f2511` (#835) | listens omit an unchanged room policy and digest mid-stretch (refresh every 25 messages, and the policy on a mode change via `Room.modeChangedAt`); a shorter `meaning`; the Codex pending-cell paragraph is stripped for clients known not to be Codex |
+| `0c4362b1` (#833) | Codex `functions.wait` with `yield_time_ms: 300000`; the backgrounded loop no longer calls `yield_control()` on a quiet poll |
+| `033cc616` (#817) | a floor-holding Moderator is not woken by board events or status pings; `thenListen` on `room_send` / `room_task` |
+| `53827a3b` (#781) | Moderator listens carry a one-line board digest and say when no other agent is live (`api/_moderatorBrief.ts`) |
+| `ec17549a`, `00287d82` (#756, #755) | the board is read on every listen, including quiet ones; a blocking listen with actionable work returns `board_action_required` (`isError`); `buildAgentResumePrompt` and a "not started" line with copyable resume instructions in the People panel |
+| `aa74a78b`, `99a825f1`, `d50ebd74` (#754, #759, #757) | the shorter join invite and join-page notice with connection-failure and `codex mcp login` guidance; `room_join` and STAYING IN text scoped to following `nextAction` |
+| `97ad9267` (#746) | the only server change (the log-in/approval blocker line in `NEXT_LISTEN`) already shipped with group B as `room_task wait` |
+| `15d28a81` (#724) | `room_join` returns `client: { detected, label, listenWindowMs, seen }`; `harnessSummary` is new here |
+| `f74f4431`, `bbf622d2` (#751, #752) | `/mcp` answers non-browser GET/HEAD with 405 and `Allow: POST, OPTIONS`, `no-store`; the landing page is `private` with `Vary: Accept` |
+| `16fd711b` (#753) | the seatKey-as-proof notice and `identity_required` hint shipped with group B; there is no seat origin here to stop deriving |
+
+Left out:
+
+- Rolling project memory in the slim-listen refresh (#835): this deployment
+  has none.
+- The `moderator_alone` room notice (#781) and the human-only-mention rule for
+  hosted agents (#853): both live in the hosted `/api/room` send path, which
+  this repository does not have. The `moderator_alone` event type is added for
+  parity.
+- Deliver mode, rental rooms and `hostVerified` wording in the join prompts.
+- The Cursor and Codex hook adapters, `.cursor/rules` and
+  `docs/integrations/PRESENCE.md` changes (#746, #754, #757): none of those
+  files exist here.
+- Server-derived seat origins and relay detection (#753).

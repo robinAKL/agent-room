@@ -194,15 +194,51 @@ describe('board inbox on join and listen', () => {
   });
 
   // A quiet hold is the hot path — it must not pay for a board read.
-  it('leaves a quiet hold lean', async () => {
+  // The board outlives chat (#755): a quiet timeout still reads it once, and a
+  // blocking listen with work returns board_action_required (#756).
+  it('breaks a quiet blocking listen with an actionable MCP error when a review is already assigned', async () => {
     const { callTool } = await import('./_mcpTools.js');
     const client = clientWithBoard();
-    const res = body(await callTool(client, 'full', 'room_listen', {
-      code: room.code, since: 0, name: 'Codex', timeoutMs: 1000,
-    }));
+    const result = await callTool(client, 'full', 'room_listen', {
+      code: room.code, since: 171, name: 'Codex', timeoutMs: 1000, wakeOn: 'addressed',
+    });
+    const res = body(result);
+    expect(result.isError).toBe(true);
+    expect(res.error).toBe('board_action_required');
+    // Some Codex wrappers only forward error/message after checking isError.
+    expect(res.message).toContain('room_task review_start for T-02');
+    expect(res.listenStatus).toBe('active');
+    expect(res.messages).toEqual([]);
+    expect(res.cursor).toBe(171);
+    expect(res.nextAction).toMatchObject({
+      kind: 'task_review', taskId: 'T-02', startReview: { arguments: { action: 'review_start' } },
+    });
+    expect(res.yourTasks).toMatchObject({ toVerify: ['T-02', 'T-04'] });
+    expect((client as unknown as { post: ReturnType<typeof vi.fn> }).post).toHaveBeenCalledTimes(1);
+  });
+
+  it('continues listening after a quiet timeout when this seat owes no work', async () => {
+    const { callTool } = await import('./_mcpTools.js');
+    const result = await callTool(clientWithBoard(), 'full', 'room_listen', {
+      code: room.code, since: 171, name: 'Bystander', timeoutMs: 1000,
+    });
+    const res = body(result);
+    expect(result.isError).not.toBe(true);
     expect(res.messages).toEqual([]);
     expect(res.yourTasks).toBeUndefined();
-    expect((client as unknown as { post: ReturnType<typeof vi.fn> }).post).not.toHaveBeenCalled();
+    expect(res.nextAction).toMatchObject({ kind: 'presence', tool: 'room_listen' });
+  });
+
+  it('allows blocking listens for a reviewer who recorded an unresolved blocker', async () => {
+    const { callTool } = await import('./_mcpTools.js');
+    const client = { post: vi.fn(async () => ({ board: { tasks: [{
+      ...BOARD.tasks[0], waiting: { scope: 'review', reason: 'Access needed', resumeWhen: 'Access restored' },
+    }] } })) } as never;
+    const result = await callTool(client, 'full', 'room_listen', {
+      code: room.code, since: 171, name: 'Codex', timeoutMs: 1000,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(body(result).nextAction).toMatchObject({ kind: 'task_wait', tool: 'room_listen' });
   });
 
   it('stays quiet on the core profile, which has no board tools', async () => {

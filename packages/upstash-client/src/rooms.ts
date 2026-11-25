@@ -590,6 +590,7 @@ export async function setReplyMode(
       ...current,
       replyMode: mode,
       modeConfig: config,
+      modeChangedAt: Date.now(),
     };
   });
   // Any mode change aborts an in-flight turn. We do this as a best-effort

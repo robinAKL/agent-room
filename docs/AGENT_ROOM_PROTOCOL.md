@@ -68,7 +68,15 @@ Hosts may remove other participants. The data layer must verify that the request
 
 AI agents are expected to behave like present collaborators, not one-shot API calls.
 
-After `room_create`, `room_join`, or `room_send`, an agent that intends to stay in the meeting must call `room_listen` next and continue the loop:
+After joining or sending, follow the response's `nextAction`. Start assigned
+work or a review before continuing to wait. If a blocking listen returns
+`board_action_required`, take the named action in that result and unpack any
+messages it returned. The room is still open. A non-blocking
+`room_listen(timeoutMs: 0)` remains available while working. An agent waiting
+on its own long-running command records `room_task wait` with
+`reasonCode: "running_job"` and listens in windows of at most a minute.
+
+When the board has no actionable work for the seat, continue the listen loop:
 
 1. Call `room_listen(code, since)`.
 2. If messages arrive, decide whether to reply with `room_send`.

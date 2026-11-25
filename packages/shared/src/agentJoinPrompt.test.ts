@@ -4,17 +4,19 @@
 // only instructions that can steer that choice are the ones carried by the
 // invite the user pastes, or printed on the page the agent lands on.
 //
-// These tests pin the two carriers: both must name the tool, say the tools may
-// be deferred, and say that joining is followed by continuous listening.
+// Both entry points must tell an agent what to do even when its MCP tools
+// never loaded and it cannot read their descriptions.
 
 import { describe, it, expect } from 'vitest';
 import {
   AGENT_ROOM_TOOL_DISCOVERY,
   buildAgentJoinPrompt,
+  buildAgentResumePrompt,
   buildJoinPageAgentNotice,
   AGENT_ROOM_MCP_URL,
   AGENT_ROOM_ASYNC_LISTEN,
   AGENT_ROOM_CODEX_WAIT,
+  AGENT_ROOM_CODEX_CONTINUE,
 } from './agentJoinPrompt.js';
 
 const CODE = 'ABC-DEF-GHJ';
@@ -28,7 +30,8 @@ describe('buildJoinPageAgentNotice', () => {
     // presuppose one being filled in, only that it must not be.
     expect(t).toContain('this page is for humans');
     expect(t).toContain('do not fill in the form');
-    expect(t).toContain('do not fall back to this page');
+    expect(t).toContain('report the exact connection error');
+    expect(t).not.toMatch(/\b(browser|shell|HTTP)\b/);
   });
 
   it('carries a callable room_join, not a description of one', () => {
@@ -39,10 +42,9 @@ describe('buildJoinPageAgentNotice', () => {
     expect(t).toContain('Use your own agent name');
   });
 
-  it('explains that a missing tool is a deferred tool', () => {
+  it('asks the agent to discover deferred tools before declaring a failure', () => {
     const t = text(CODE);
-    expect(t).toContain('Deferred, not missing');
-    expect(t).toContain('agent_room');
+    expect(t).toContain('deferred Agent Room tools');
     expect(t).toContain('ALL_TOOLS');
   });
 
@@ -51,8 +53,8 @@ describe('buildJoinPageAgentNotice', () => {
   // not free, because it buries the four lines that do the deciding.
   it('points at room_listen rather than restating its contract', () => {
     const t = text(CODE);
-    expect(t).toContain('keep room_listen running');
-    expect(t).toContain('its description tells you how');
+    expect(t).toContain('Start assigned work or review first');
+    expect(t).toContain('Use room_listen when ready to wait for messages');
     for (const moved of [
       'quiet timeout is not a stop condition',
       'reply with no tool call ends your turn',
@@ -61,8 +63,7 @@ describe('buildJoinPageAgentNotice', () => {
     ]) {
       expect(t, `${moved} belongs on room_listen`).not.toContain(moved);
     }
-    expect(buildJoinPageAgentNotice(CODE)).toHaveLength(4);
-    expect(t.length).toBeLessThan(600);
+    expect(t).toContain('codex mcp login');
   });
 
   it('still names the tool when the code is not known yet', () => {
@@ -80,7 +81,42 @@ describe('AGENT_ROOM_ASYNC_LISTEN', () => {
     expect(AGENT_ROOM_ASYNC_LISTEN).toContain('// @exec: {"yield_time_ms": 1000}');
     expect(AGENT_ROOM_ASYNC_LISTEN).toContain('while (true) {');
     expect(AGENT_ROOM_ASYNC_LISTEN).toContain('tools.mcp__agent_room__room_listen(');
-    expect(AGENT_ROOM_ASYNC_LISTEN).toContain('await yield_control();');
+  });
+
+  // Every return from functions.wait is a model turn that re-sends the whole
+  // context. Yielding on each quiet 45s poll woke Codex ~80 times an hour in
+  // an empty room. Measured 2026-11-23: a 5-minute wait works and still
+  // returns the moment the cell completes.
+  it('stays in the cell on a quiet poll and waits 5 minutes', () => {
+    expect(AGENT_ROOM_ASYNC_LISTEN).not.toContain('yield_control');
+    expect(AGENT_ROOM_CODEX_CONTINUE).toContain('yield_time_ms: 300000 })');
+    expect(AGENT_ROOM_CODEX_WAIT).toContain('yield_time_ms: 300000 (if functions.wait rejects that, use the largest value it accepts)');
+    expect(AGENT_ROOM_CODEX_WAIT).not.toContain('45000');
+    // The MCP poll itself stays inside Codex's 60s tool timeout.
+    expect(AGENT_ROOM_ASYNC_LISTEN).toContain('timeoutMs: 45000');
+  });
+
+  it('keeps polling through quiet windows and breaks on the first message', async () => {
+    const lines = AGENT_ROOM_ASYNC_LISTEN.split('\n');
+    const start = lines.findIndex(line => line === 'while (true) {');
+    const end = lines.indexOf('}', start);
+    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+    const run = new AsyncFunction('tools', 'code', 'name', 'load', 'store', 'text', 'yield_control', lines.slice(start, end + 1).join('\n'));
+    let polls = 0;
+    let cursor = 10;
+    const sinces: unknown[] = [];
+    const output: unknown[] = [];
+    await run({ mcp__agent_room__room_listen: async (args: { since: unknown }) => {
+      sinces.push(args.since);
+      polls++;
+      const messages = polls < 7 ? [] : [{ name: 'host', text: '@Codex ping' }];
+      return { content: [{ type: 'text', text: JSON.stringify({ listenStatus: 'active', cursor: ++cursor, messages, addressedYou: polls >= 7 }) }] };
+    } },
+      CODE, 'Codex', () => cursor, (_k: string, v: number) => { cursor = v; }, (value: unknown) => output.push(value),
+      () => { throw new Error('a quiet poll handed the turn back to the model'); });
+    expect(polls).toBe(7);
+    expect(sinces).toEqual([10, 11, 12, 13, 14, 15, 16]);
+    expect(output).toEqual([expect.objectContaining({ addressedYou: true, cursor: 17 })]);
   });
 
   it('carries the cursor across cells so a restart resumes', () => {
@@ -129,6 +165,29 @@ describe('AGENT_ROOM_ASYNC_LISTEN', () => {
     expect(AGENT_ROOM_ASYNC_LISTEN).toContain('Do not post another status-only update');
     expect(AGENT_ROOM_ASYNC_LISTEN).toContain('do not restart room_listen before that board transition');
   });
+
+  it.each(['task_review', 'task_work', 'task_recovery'])(
+    'returns %s to Codex even when there are no host messages',
+    async (kind) => {
+      const lines = AGENT_ROOM_ASYNC_LISTEN.split('\n');
+      const start = lines.findIndex(line => line === 'while (true) {');
+      const end = lines.indexOf('}', start);
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      const run = new AsyncFunction('tools', 'code', 'name', 'load', 'store', 'text', 'yield_control', lines.slice(start, end + 1).join('\n'));
+      const directive = { kind, taskId: 'T-08' };
+      const payload = { listenStatus: 'active', cursor: 171, messages: [], nextAction: directive };
+      const output: unknown[] = [];
+
+      await run({ mcp__agent_room__room_listen: async () => ({
+        isError: true,
+        content: [{ type: 'text', text: JSON.stringify({ ...payload, error: 'board_action_required' }) }],
+      }) },
+        CODE, 'Codex', () => 171, () => {}, (value: unknown) => output.push(value),
+        () => { throw new Error('Pending board work was lost inside the listen loop'); });
+
+      expect(output).toEqual([expect.objectContaining({ nextAction: directive })]);
+    },
+  );
 
   // The prose above is read once at session start. By the time the loop breaks
   // it is minutes and dozens of tool calls back, and the break itself used to
@@ -183,7 +242,8 @@ describe('AGENT_ROOM_TOOL_DISCOVERY', () => {
   // "unknowable until you have already chosen a tool" — everything else belongs
   // on the tool, where it is paid for once instead of eight times.
   it('carries only what is decidable with no tool description in hand', () => {
-    expect(AGENT_ROOM_TOOL_DISCOVERY).toContain('call MCP room_join, not a browser');
+    expect(AGENT_ROOM_TOOL_DISCOVERY).toContain('To join, call MCP room_join.');
+    expect(AGENT_ROOM_TOOL_DISCOVERY).not.toMatch(/\b(browser|shell|HTTP)\b/);
     expect(AGENT_ROOM_TOOL_DISCOVERY).toContain('deferred in your catalog');
     expect(AGENT_ROOM_TOOL_DISCOVERY).toContain('not a request to join');
   });
@@ -215,19 +275,18 @@ describe('buildAgentJoinPrompt', () => {
   // Every clause has to be one a tool description cannot supply. Anything else
   // is duplication, and this text is pasted into a chat — it is paid for in the
   // agent's context on every use, unlike a description that is read once.
-  it('carries the browser-versus-MCP choice, which is made before any description is read', () => {
+  it('selects MCP for joining and leaves tools available for room tasks', () => {
     const t = invite();
-    expect(t).toContain('over MCP');
-    expect(t).toContain('room_join');
-    expect(t).toContain('do not open a browser');
-    expect(t).toContain(CODE);
+    expect(t).toContain(`passing this link to MCP room_join: https://www.agent-room.com/j/${CODE}`);
+    expect(t).toContain('Use your usual tools for room tasks.');
+    expect(t).not.toMatch(/\b(browser|shell|HTTP)\b/);
   });
 
   it('carries the user\'s own authorisation to stay', () => {
     // Only the person who asked for the join can say how long it lasts. A tool
     // description can state that a quiet hold is not an exit; it cannot state
     // that THIS user wants the agent to stay.
-    expect(invite()).toContain('stay in it until I say stop');
+    expect(invite()).toContain('Stay in the room until I say stop.');
   });
 
   it('restates nothing that ships with the tools', () => {
@@ -244,12 +303,27 @@ describe('buildAgentJoinPrompt', () => {
     expect(t).not.toContain('ALL_TOOLS');
   });
 
-  it('is one line', () => {
-    const url = `https://www.agent-room.com/j/${CODE}`;
-    const t = buildAgentJoinPrompt(url);
-    expect(t.split('\n')).toHaveLength(1);
-    expect(t.length).toBeLessThan(200);
-    expect(t.split(url)).toHaveLength(2);
+  it('asks the agent to report the exact connection error', () => {
+    const t = invite();
+    expect(t).toContain('If Agent Room MCP is unavailable, report the exact connection error.');
+  });
+
+  it('leaves nextAction, listen, and Codex login off the paste', () => {
+    const t = invite();
+    expect(t).not.toContain('nextAction');
+    expect(t).not.toContain('codex mcp login');
+    expect(t.length).toBeLessThan(400);
+  });
+});
+
+describe('buildAgentResumePrompt', () => {
+  it('keeps the seat and points at nextAction without the login lecture', () => {
+    const t = buildAgentResumePrompt(`https://www.agent-room.com/j/${CODE}`, 'Codex');
+    expect(t).toContain('Keep seat "Codex"');
+    expect(t).toContain('nextAction');
+    expect(t).toContain('report the exact connection error');
+    expect(t).not.toMatch(/\b(browser|shell|HTTP)\b/);
+    expect(t).not.toContain('codex mcp login');
   });
 });
 

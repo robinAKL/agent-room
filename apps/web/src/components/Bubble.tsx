@@ -1,7 +1,18 @@
 import { Avatar } from './Avatar.js';
-import { useMemo, type ReactNode } from 'react';
+import { createContext, useContext, useMemo, type ReactNode } from 'react';
 import type { Message, MessageAttachment } from '@agent-room/shared';
 import { normalizeEscapedWhitespace } from '@agent-room/shared';
+import { mentionTokenSource } from '../lib/mentions.js';
+
+/**
+ * Names of the people in the room, one per line, so a mention of a spaced
+ * name ("@x t d") is highlighted whole instead of stopping at the first space.
+ * A string rather than an array so its identity only changes when the roster
+ * does. Rooms provide it around the feed; elsewhere it is empty and plain
+ * @tokens still highlight.
+ */
+const MentionNamesContext = createContext<string>('');
+export const MentionNamesProvider = MentionNamesContext.Provider;
 
 interface Props {
   message: Message;
@@ -161,6 +172,7 @@ function MessageText({ text }: { text: string }) {
   // same normalization here at render time makes them readable too.
   // No-op for well-formed text, see normalizeEscapedWhitespace JSDoc.
   const blocks = useMemo(() => parseBlocks(normalizeEscapedWhitespace(text)), [text]);
+  const mentionNames = useContext(MentionNamesContext);
 
   return (
     <div className="space-y-2">
@@ -179,7 +191,7 @@ function MessageText({ text }: { text: string }) {
           return (
             <ListTag key={index} className={`${ordered ? 'list-decimal' : 'list-disc'} pl-5 space-y-1`}>
               {block.items.map((item, itemIndex) => (
-                <li key={itemIndex}>{renderInline(item.replace(/^(\d+[.)]|[-*•])\s+/, ''))}</li>
+                <li key={itemIndex}>{renderInline(item.replace(/^(\d+[.)]|[-*•])\s+/, ''), mentionNames)}</li>
               ))}
             </ListTag>
           );
@@ -188,14 +200,14 @@ function MessageText({ text }: { text: string }) {
         if (block.type === 'heading') {
           return (
             <div key={index} className="font-semibold text-[13px] text-current">
-              {renderInline(block.text.replace(/^#{1,3}\s*/, ''))}
+              {renderInline(block.text.replace(/^#{1,3}\s*/, ''), mentionNames)}
             </div>
           );
         }
 
         return (
           <p key={index} className="whitespace-pre-wrap">
-            {renderInline(block.text)}
+            {renderInline(block.text, mentionNames)}
           </p>
         );
       })}
@@ -284,7 +296,26 @@ function parseBlocks(text: string): TextBlock[] {
 //   [DECISION] x     — chip-style artifact marker (also TODO / STATUS / RESULT)
 // The artifact marker chip mirrors extractArtifacts, which recognizes markers
 // anywhere on a message line.
-const INLINE_PATTERN = /(\[(?:DECISION|TODO|STATUS|RESULT)\])|(`[^`]+`|\*\*[^*]+\*\*|https?:\/\/[^\s]+)/gi;
+//   @Name            — mention, including roster names with spaces
+// Capture groups, in order: 1 = artifact marker, 2 = mention prefix boundary,
+// 3 = @mention, 4 = code/bold/link. The pattern is built per roster and cached.
+const ARTIFACT_SOURCE = /(\[(?:DECISION|TODO|STATUS|RESULT)\])/.source;
+const MENTION_PREFIX_SOURCE = /(^|[^\p{L}\p{N}_@.-])/u.source;
+const VALUE_SOURCE = /(`[^`]+`|\*\*[^*]+\*\*|https?:\/\/[^\s]+)/.source;
+const INLINE_PATTERNS = new Map<string, RegExp>();
+
+function inlinePatternFor(names: string): RegExp {
+  let pattern = INLINE_PATTERNS.get(names);
+  if (!pattern) {
+    pattern = new RegExp(
+      `${ARTIFACT_SOURCE}|${MENTION_PREFIX_SOURCE}(${mentionTokenSource(names ? names.split('\n') : [])})|${VALUE_SOURCE}`,
+      'giu',
+    );
+    if (INLINE_PATTERNS.size > 50) INLINE_PATTERNS.clear();
+    INLINE_PATTERNS.set(names, pattern);
+  }
+  return pattern;
+}
 
 const ARTIFACT_TONE: Record<string, string> = {
   DECISION: 'bg-emerald-100 text-emerald-800 ring-emerald-200',
@@ -293,19 +324,28 @@ const ARTIFACT_TONE: Record<string, string> = {
   RESULT:   'bg-violet-100 text-violet-800 ring-violet-200',
 };
 
-function renderInline(text: string): ReactNode[] {
+export function renderInline(text: string, mentionNames = ''): ReactNode[] {
   const nodes: ReactNode[] = [];
   let lastIndex = 0;
   let match: RegExpExecArray | null;
+  const INLINE_PATTERN = inlinePatternFor(mentionNames);
   INLINE_PATTERN.lastIndex = 0;
 
   while ((match = INLINE_PATTERN.exec(text))) {
     if (match.index > lastIndex) nodes.push(text.slice(lastIndex, match.index));
 
     const artifactMarker = match[1];
-    const value = match[2] ?? artifactMarker ?? match[0];
+    const mention = match[3];
+    const value = match[4] ?? artifactMarker ?? match[0];
 
-    if (artifactMarker) {
+    if (mention) {
+      if (match[2]) nodes.push(match[2]);
+      nodes.push(
+        <span key={nodes.length} className="rounded bg-accent-tint px-0.5 font-semibold text-accent">
+          {mention}
+        </span>,
+      );
+    } else if (artifactMarker) {
       const kind = artifactMarker.slice(1, -1).toUpperCase();
       const tone = ARTIFACT_TONE[kind] ?? 'bg-black/10 text-current ring-black/10';
       nodes.push(

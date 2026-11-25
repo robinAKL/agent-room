@@ -51,6 +51,21 @@ export interface HttpHarness {
    * `undefined` means "not identified" — clamp nothing, change nothing.
    */
   maxListenMs?: number;
+  /**
+   * The raw signals this guess was made from, echoed back at join. A client
+   * reaching this endpoint through a connector can come out `unknown`, and
+   * nobody could say what it had sent — so a missing signature could only be
+   * guessed at. With the signals in the join result, adding one is a lookup.
+   */
+  seen?: { userAgent?: string; clientName?: string };
+}
+
+const SEEN_MAX_CHARS = 160;
+
+function seenValue(raw: string | undefined): string | undefined {
+  // Header text goes back to the agent verbatim, so keep it one short line.
+  const clean = raw?.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+  return clean ? clean.slice(0, SEEN_MAX_CHARS) : undefined;
 }
 
 /**
@@ -116,7 +131,33 @@ export function detectHarness(
   // clientInfo is the more deliberate signal (a client names itself), so it
   // wins when present; the User-Agent is what is actually there most of the
   // time on this stateless endpoint.
-  return classify(clientName) ?? classify(ua) ?? UNKNOWN;
+  const harness = classify(clientName) ?? classify(ua) ?? UNKNOWN;
+  const seenUa = seenValue(ua);
+  const seenName = seenValue(clientName);
+  if (!seenUa && !seenName) return harness;
+  // A copy: SIGNATURES entries are shared across every request.
+  return {
+    ...harness,
+    seen: { ...(seenUa ? { userAgent: seenUa } : {}), ...(seenName ? { clientName: seenName } : {}) },
+  };
+}
+
+/**
+ * What room_join reports about the caller: the detected client, the listen
+ * window it is held to, and the raw signals the guess came from.
+ */
+export function harnessSummary(harness?: HttpHarness): {
+  detected: HarnessKind;
+  label: string;
+  listenWindowMs: number | null;
+  seen?: { userAgent?: string; clientName?: string };
+} {
+  return {
+    detected: harness?.kind ?? 'unknown',
+    label: harness?.label ?? UNKNOWN.label,
+    listenWindowMs: harness?.maxListenMs ?? null,
+    ...(harness?.seen ? { seen: harness.seen } : {}),
+  };
 }
 
 /**

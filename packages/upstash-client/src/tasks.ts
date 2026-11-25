@@ -1019,7 +1019,7 @@ export interface WaitTaskInput {
   waitingFor?: string;
 }
 
-const WAIT_REASONS = new Set<string>(['missing_user_input', 'missing_credential', 'tool_failure', 'dependency', 'other']);
+const WAIT_REASONS = new Set<string>(['missing_user_input', 'missing_credential', 'tool_failure', 'dependency', 'running_job', 'other']);
 const sameActor = (name: string | undefined, client: ClientKind | undefined, actor: { name: string; client: ClientKind }) =>
   !!name && name.trim().toLowerCase() === actor.name.trim().toLowerCase() && (!client || client === actor.client);
 

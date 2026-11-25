@@ -79,15 +79,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
     return;
   }
 
-  // Browser / crawler GET (Accept: text/html) — MCP Streamable HTTP uses POST
-  // in this deployment; clients probing with text/event-stream must still hit
-  // the transport and get the spec-correct 405 when SSE isn't offered.
+  // Browser / crawler GET (Accept: text/html) gets the landing page. Every
+  // other GET is a client asking for the standalone server-push SSE stream,
+  // and it must be answered with 405 HERE, before the transport sees it.
+  //
+  // The SDK transport does not refuse that GET in stateless mode: it answers
+  // 200 text/event-stream and holds the stream open with nothing to ever send
+  // on it. A proxy then cuts the idle stream, the client reconnects, and a
+  // client that counts reconnects without progress gives up on the whole
+  // server — the Go MCP SDK does after five ("standalone SSE stream: exceeded
+  // 5 retries without progress"), failing the in-flight room_listen with it.
+  // 405 is what the spec prescribes for a server that offers no such stream.
   if (req.method === 'GET' || req.method === 'HEAD') {
     const accept = typeof req.headers.accept === 'string' ? req.headers.accept : '';
     const wantsHtml = accept.includes('text/html');
+    // ONE URL, TWO ANSWERS, so a shared cache must never hold either of them.
+    // A CDN keyed on the URL alone would otherwise serve the cached landing
+    // page (status 200) to MCP clients asking for the stream. `private` keeps
+    // the page cacheable in the visitor's own browser and out of the CDN;
+    // Vary covers any intermediary that would cache it anyway.
+    res.setHeader('Vary', 'Accept');
     if (wantsHtml) {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=3600');
+      res.setHeader('Cache-Control', 'private, max-age=300');
       res.status(200);
       if (req.method === 'HEAD') {
         res.end();
@@ -96,6 +110,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
       res.send(MCP_LANDING_HTML);
       return;
     }
+    res.setHeader('Allow', 'POST, OPTIONS');
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(405);
+    if (req.method === 'HEAD') {
+      res.end();
+      return;
+    }
+    res.json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Method not allowed: this endpoint is stateless and offers no SSE stream. Use POST.' },
+      id: null,
+    });
+    return;
   }
 
   // No bearer-token layer here, on purpose. The hosted deployment accepts an
