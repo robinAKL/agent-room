@@ -1,4 +1,5 @@
 import type { Task, TaskBoard } from './types.js';
+import { activeTaskLease } from './taskExecution.js';
 
 /**
  * What the board is waiting on from one agent.
@@ -37,6 +38,13 @@ export interface TaskInbox {
   current: string[];
   /** Owned todo tasks waiting to be claimed. */
   queued: string[];
+  /** Explicitly blocked owner/review responsibilities; never immediate work. */
+  waiting?: Array<{ id: string; scope: 'owner' | 'review'; kind?: 'capability' | 'decision'; reason: string; waitingFor?: string; resumeWhen?: string }>;
+  /** Current review notification id per task, for room_task ack / review_start. */
+  reviewEvents?: Record<string, string>;
+  /** Owned tasks whose fenced execution ended and must be explicitly recovered. */
+  toRecover?: string[];
+  executions?: Record<string, { attemptId: string; expiresAt?: number; status?: string }>;
   /** One line naming what is waiting, or '' when nothing is. */
   hint: string;
 }
@@ -83,11 +91,36 @@ export function taskInboxFor(
   const toVerify: string[] = [];
   const active: string[] = [];
   const queued: string[] = [];
+  const waiting: NonNullable<TaskInbox['waiting']> = [];
+  const reviewEvents: Record<string, string> = {};
+  const toRecover: string[] = [];
+  const executions: NonNullable<TaskInbox['executions']> = {};
   for (const task of board.tasks as Task[]) {
     if (task.state === 'awaiting_review' && isFor(task.verifier, name)) {
-      toVerify.push(task.id);
+      if (task.reviewStatus === 'waiting_for_capability') {
+        waiting.push({ id: task.id, scope: 'review', kind: 'capability', reason: task.reviewReadiness ?? 'Required capabilities are unknown', resumeWhen: 'Report matching capabilities or reassign the review' });
+      } else if (task.waiting?.scope === 'review' && task.waiting.resumedAt === undefined) {
+        waiting.push({ id: task.id, scope: 'review', reason: task.waiting.reason, waitingFor: task.waiting.waitingFor, resumeWhen: task.waiting.resumeWhen });
+      } else {
+        toVerify.push(task.id);
+        if (task.notification?.kind === 'review_requested') reviewEvents[task.id] = task.notification.id;
+      }
     } else if (OPEN_OWNER_STATES.has(task.state) && isFor(task.owner, name)) {
-      if (task.state === 'in_progress' || task.state === 'rejected' || task.state === 'blocked') {
+      if (task.execution?.decisionRequired) {
+        waiting.push({ id: task.id, scope: 'owner', kind: 'decision', reason: 'Repeated rejections require an explicit decision', resumeWhen: 'The task is explicitly reopened or cancelled' });
+        continue;
+      }
+      if (task.execution) {
+        const attempt = task.attempts?.find(a => a.id === task.execution!.attemptId);
+        executions[task.id] = { attemptId: task.execution.attemptId, expiresAt: task.lease?.expiresAt, status: attempt?.status };
+        if (task.state !== 'blocked' && (!activeTaskLease(task.lease, Date.now()) || attempt?.status !== 'running')) {
+          toRecover.push(task.id); continue;
+        }
+      }
+      if (task.state === 'blocked') {
+        waiting.push({ id: task.id, scope: 'owner', reason: task.waiting?.reason ?? task.blocked?.reason ?? 'Waiting for missing input',
+          waitingFor: task.waiting?.waitingFor, resumeWhen: task.waiting?.resumeWhen });
+      } else if (task.state === 'in_progress' || task.state === 'rejected') {
         active.push(task.id);
       } else {
         queued.push(task.id);
@@ -97,8 +130,8 @@ export function taskInboxFor(
   // Current work always comes before queued work, even if the board was
   // created in another order. This gives weak agents one unambiguous next
   // action instead of a flat bag of ids.
-  const toDo = [...active, ...queued];
-  if (!toVerify.length && !toDo.length) {
+  const toDo = [...active, ...queued, ...toRecover, ...waiting.filter(t => t.scope === 'owner').map(t => t.id)];
+  if (!toVerify.length && !toDo.length && !waiting.length) {
     if (!opts.addressed) return empty;
     // Somebody else's unclaimed todo is takeable; otherwise open your own.
     const free = (board.tasks as Task[]).filter(t => t.state === 'todo' && !isFor(t.owner, name));
@@ -112,10 +145,13 @@ export function taskInboxFor(
   }
 
   const parts: string[] = [];
+  if (toRecover.length) parts.push(`RECOVERY REQUIRED: ${toRecover.join(', ')}. Read the attempt history/evidence and use room_task recover with a resolution. Lease expiry is not task failure or room expiry.`);
+  if (waiting.length) parts.push(`WAITING: ${waiting.map(t => `${t.id}: ${t.reason}${t.resumeWhen ? `; resume when ${t.resumeWhen}` : ''}`).join(' | ')}. `
+    + 'Keep room_listen to receive missing input. Capability gaps need room_task capabilities or reassignment; repeated-rejection decisions need explicit reopen/cancel, not automatic recovery; input waits need room_task resume with a resolution. Ordinary chat does not release a wait.');
   if (toVerify.length) {
     parts.push(
       `${toVerify.join(', ')} ${toVerify.length === 1 ? 'is' : 'are'} awaiting YOUR verdict `
-      + '— nobody else can rule on them. Re-run the evidence yourself, then '
+      + '— nobody else can rule on them. Call room_task review_start to accept the review, re-run the evidence yourself, then '
       + 'room_task({ action: "verify", id, verdict, note }).',
     );
   }
@@ -138,7 +174,9 @@ export function taskInboxFor(
       );
     }
   }
-  return { toVerify, toDo, current: active, queued, hint: `BOARD: ${parts.join(' ')}` };
+  return { toVerify, toDo, current: active, queued, ...(waiting.length ? { waiting } : {}),
+    ...(toRecover.length ? { toRecover } : {}), ...(Object.keys(executions).length ? { executions } : {}),
+    ...(Object.keys(reviewEvents).length ? { reviewEvents } : {}), hint: `BOARD: ${parts.join(' ')}` };
 }
 
 /**
@@ -167,6 +205,7 @@ export function boardCallouts(board: Pick<TaskBoard, 'tasks'> | null | undefined
     names.push(name);
   };
   for (const task of board.tasks as Task[]) {
+    if (task.state === 'blocked' || task.execution?.decisionRequired || task.reviewStatus === 'waiting_for_capability' || (task.waiting && task.waiting.resumedAt === undefined)) continue;
     if (task.state === 'awaiting_review') remember(task.verifier);
     else if (OPEN_OWNER_STATES.has(task.state)) remember(task.owner);
   }

@@ -4,7 +4,7 @@ import type {
   ReplyMode,
   ReplyModeConfig,
 } from '@agent-room/shared';
-import { AVATAR_PALETTE, DEFAULT_TURN_TIMEOUTS_MS, PRESENCE_DISCONNECTED_MS, ROOM_TTL_SECONDS } from '@agent-room/shared';
+import { AVATAR_PALETTE, DEFAULT_TURN_TIMEOUTS_MS, PRESENCE_DISCONNECTED_MS, ROOM_TTL_SECONDS, participantMemberId } from '@agent-room/shared';
 import type { UpstashClient } from './client.js';
 import { sha256Hex } from './sha256.js';
 import { RoomNotFoundError, ConcurrencyError } from './errors.js';
@@ -192,6 +192,10 @@ export interface JoinRoomOptions {
   // Authenticated Clerk user id. When it matches room.ownerId, join reclaims
   // the host slot under the canonical createdBy name and evicts stale host rows.
   authedUserId?: string | null;
+  // Agent seats only: the private seatKey a previous join returned. A match
+  // keeps the seat identity (and any execution lease bound to it); anything
+  // else rotates the key, fencing whichever process held the old one.
+  seatKey?: string;
 }
 
 // Returns the updated Room with an extra `participant` field showing the
@@ -199,7 +203,15 @@ export interface JoinRoomOptions {
 // was suffixed). Existing callers reading `result.participants` etc. still
 // work; new callers can read `result.participant.name` to learn what name
 // was actually assigned.
-export type JoinRoomResult = Room & { participant: Participant };
+export type JoinRoomResult = Room & { participant: Participant; seatKey?: string };
+
+/** Constant-time compare of two hex digests. */
+export function seatHashMatches(stored: string | undefined, presented: string | undefined): boolean {
+  if (!stored || !presented || stored.length !== presented.length) return false;
+  let diff = 0;
+  for (let i = 0; i < stored.length; i++) diff |= stored.charCodeAt(i) ^ presented.charCodeAt(i);
+  return diff === 0;
+}
 
 function namesEqualIgnoreCase(a: string, b: string): boolean {
   return a.trim().toLowerCase() === b.trim().toLowerCase();
@@ -255,8 +267,19 @@ export async function joinRoom(
   options: JoinRoomOptions = {}
 ): Promise<JoinRoomResult> {
   let outParticipant = participant;
+  // Agent seats carry a private seat key. Hashing is async, so it happens
+  // before the synchronous mutator: the presented key's hash, and a fresh key
+  // in case the presented one does not match.
+  const agentSeat = participant.client === 'cc';
+  const presentedSeatHash = agentSeat && options.seatKey ? await sha256Hex(options.seatKey) : undefined;
+  const freshSeatKey = agentSeat ? generateHostKey() + generateHostKey() : undefined;
+  const freshSeatHash = freshSeatKey ? await sha256Hex(freshSeatKey) : undefined;
+  let issuedSeatKey: string | undefined;
   const room = await casRoom(client, code, (current) => {
-    let next = { ...participant };
+    // Seat identity and capability provenance are server-owned: never taken
+    // from the caller-supplied participant object.
+    const { seatKeyHash: _h, seatId: _i, capabilities: _c, ...input } = participant;
+    let next: Participant = { ...input };
     const isOwnerReclaim = Boolean(
       options.authedUserId && current.ownerId && options.authedUserId === current.ownerId,
     );
@@ -316,6 +339,15 @@ export async function joinRoom(
     if (next.canSpeak === undefined) {
       next = { ...next, canSpeak: true };
     }
+    if (agentSeat && freshSeatHash) {
+      const reclaimed = current.participants.find(p => p.client === 'cc'
+        && (isPriorIdentity(p, options.priorIdentity) || p.name === next.name));
+      const kept = !!reclaimed?.seatKeyHash && seatHashMatches(reclaimed.seatKeyHash, presentedSeatHash);
+      next = kept
+        ? { ...next, seatKeyHash: reclaimed!.seatKeyHash, seatId: reclaimed!.seatId ?? `key:${reclaimed!.seatKeyHash}` }
+        : { ...next, seatKeyHash: freshSeatHash, seatId: freshSeatHash.slice(0, 32) };
+      issuedSeatKey = kept ? options.seatKey : freshSeatKey;
+    }
     // Assigned AFTER the canSpeak materialization so the returned
     // `outParticipant` reflects the final stored row, including its
     // approval state (callers like the MCP room_join handler look at this
@@ -336,7 +368,52 @@ export async function joinRoom(
     return { ...current, participants: [...keep, next] };
   });
 
-  return { ...room, participant: outParticipant };
+  return { ...room, participant: outParticipant, ...(issuedSeatKey ? { seatKey: issuedSeatKey } : {}) };
+}
+
+/** Thrown when a task-execution or capability call cannot prove its seat. */
+export class SeatProofError extends Error {
+  constructor(message = 'Prove the current agent seat with the seatKey room_join returned; display names are not identity proof.') {
+    super(message);
+    this.name = 'SeatProofError';
+  }
+}
+
+/** The joined agent seat that holds this seatKey, or null. */
+export async function provenAgentSeat(
+  room: Pick<Room, 'participants'>,
+  name: string,
+  seatKey: string | undefined,
+): Promise<Participant | null> {
+  if (!seatKey) return null;
+  const hash = await sha256Hex(seatKey);
+  return room.participants.find(p => p.client === 'cc' && p.name === name && p.canSpeak !== false
+    && seatHashMatches(p.seatKeyHash, hash)) ?? null;
+}
+
+/**
+ * Record what an agent says it can do in its current context. Agent-declared,
+ * not verified access: the report is bound to the seat identity and cleared on
+ * the next join. Sanitising happens in taskExecution.ts.
+ */
+export async function reportAgentCapabilities(
+  client: UpstashClient,
+  code: string,
+  name: string,
+  capabilities: unknown,
+  seatKey: string | undefined,
+  sanitize: (input: unknown, memberId: string, now: number) => NonNullable<Participant['capabilities']>,
+): Promise<Room> {
+  const before = await getRoom(client, code);
+  const seat = before.status === 'active' ? await provenAgentSeat(before, name, seatKey) : null;
+  const memberId = seat && participantMemberId(seat);
+  if (!seat || !memberId) throw new SeatProofError('Prove the joined seat (seatKey from room_join) before reporting its capabilities.');
+  const report = sanitize(capabilities, memberId, Date.now());
+  return casRoom(client, code, room => ({
+    ...room,
+    participants: room.participants.map(p => p.client === 'cc' && p.name === name && p.seatKeyHash === seat.seatKeyHash
+      ? { ...p, capabilities: report, lastSeenAt: report.reportedAt } : p),
+  }));
 }
 
 // Pre-flight check used by callers that intend to join with the host's name.
@@ -630,6 +707,7 @@ export async function reactivateRoom(
     ...current,
     status: 'active' as const,
     endedAt: undefined,
+    reactivatedAt: Date.now(),
   }));
 }
 

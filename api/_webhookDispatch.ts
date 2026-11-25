@@ -80,7 +80,7 @@ export interface WebhookMessageEvent {
   event: 'message';
   code: string;
   topic: string;
-  message: Pick<Message, 'id' | 'name' | 'client' | 'role' | 'text' | 'time'>;
+  message: Pick<Message, 'id' | 'name' | 'client' | 'role' | 'text' | 'time' | 'metadata'>;
   // Absolute message cursor after this message — pass as `since` to
   // room_list_messages / room_listen to read anything newer.
   cursor?: number;
@@ -134,7 +134,11 @@ export async function dispatchRoomWebhooks(
   } catch {
     return;
   }
-  const targets = hooks.filter(h => h.registeredBy !== message.name);
+  // A task notification is for one participant: only that participant's
+  // webhooks are woken by it, not every resident in the room.
+  const taskTarget = message.metadata?.taskEventId ? message.metadata.targetAgentName?.trim().toLowerCase() : undefined;
+  const targets = hooks.filter(h => h.registeredBy !== message.name
+    && (!taskTarget || h.registeredBy.trim().toLowerCase() === taskTarget));
   if (targets.length === 0) return;
 
   const payload: WebhookMessageEvent = {
@@ -148,6 +152,7 @@ export async function dispatchRoomWebhooks(
       role: message.role,
       text: message.text,
       time: message.time,
+      ...(message.metadata ? { metadata: message.metadata } : {}),
     },
     ...(cursor !== null ? { cursor } : {}),
   };

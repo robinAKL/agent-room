@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Task, TaskState } from '@agent-room/shared';
-import { canRuleOn, partitionTasks } from './TaskBoard.js';
+import { canRuleOn, executionSummary, partitionTasks, taskReviewLabel } from './TaskBoard.js';
 
 function task(id: string, state: TaskState, extra: Partial<Task> = {}): Task {
   return {
@@ -78,5 +78,39 @@ describe('canRuleOn', () => {
     const t = task('T-01', 'awaiting_review', { owner: 'Claude', verifier: 'Robin', verifierClient: 'cc' });
     expect(canRuleOn(t, web, false)).toBe(false);
     expect(canRuleOn(t, { name: 'Robin', client: 'cc' }, false)).toBe(true);
+  });
+});
+
+describe('review and execution lines', () => {
+  const web = { name: 'Robin', client: 'web' as const };
+
+  it('lets the host rule over a designated agent reviewer, but never on an open review wait', () => {
+    const t = task('T-01', 'awaiting_review', { owner: 'Claude', verifier: 'Codex', verifierClient: 'cc' });
+    expect(canRuleOn(t, web, false)).toBe(false);
+    expect(canRuleOn(t, web, false, true)).toBe(true);
+    const waiting = { ...t, waiting: { scope: 'review' as const, reasonCode: 'missing_credential' as const, reason: 'no access',
+      resumeWhen: 'access granted', by: 'Codex', byClient: 'cc' as const, at: 1 } };
+    expect(canRuleOn(waiting, web, false, true)).toBe(false);
+  });
+
+  it('explains missing or offline reviewers and names who actually ruled', () => {
+    expect(taskReviewLabel(task('T-1', 'awaiting_review'))).toBe('Waiting for an independent reviewer');
+    expect(taskReviewLabel(task('T-1', 'todo'))).toBe('Assigned on submission');
+    expect(taskReviewLabel(task('T-1', 'awaiting_review', { verifier: 'Codex', reviewStatus: 'verifier_offline' }))).toContain('offline');
+    expect(taskReviewLabel(task('T-1', 'done', { verdict: { by: 'Actual Reviewer', byClient: 'cc', verdict: 'done', at: 1 } })))
+      .toBe('Verified by @Actual Reviewer');
+  });
+
+  it('summarises the current fenced execution', () => {
+    const base = { execution: { attemptId: 'a2', recoveryRequired: false },
+      attempts: [
+        { id: 'a1', leaseId: 'l1', memberId: 'm', name: 'Codex', client: 'cc' as const, status: 'interrupted' as const, startedAt: 1, confirmedAt: 1 },
+        { id: 'a2', leaseId: 'l2', memberId: 'm', name: 'Codex', client: 'cc' as const, status: 'running' as const, startedAt: 2, confirmedAt: 2 },
+      ],
+      lease: { id: 'l2', holderId: 'm', holderName: 'Codex', holderClient: 'cc' as const, status: 'active' as const, grantedAt: 2, expiresAt: 10_000 } };
+    expect(executionSummary(task('T-1', 'in_progress', base), 5_000)).toBe('Executing · @Codex · attempt 2');
+    expect(executionSummary(task('T-1', 'in_progress', { ...base, execution: { attemptId: 'a2', recoveryRequired: true },
+      attempts: [{ ...base.attempts[1]!, status: 'interrupted', endReason: 'lease_expired' }] }), 20_000)).toBe('Execution lease expired · needs recovery');
+    expect(executionSummary(task('T-1', 'todo'))).toBeNull();
   });
 });
