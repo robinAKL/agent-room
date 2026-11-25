@@ -768,18 +768,17 @@ describe('role reassignment (owner/verifier escape hatch)', () => {
     expect(board.tasks[0]!.roleHistory).toBeUndefined();
   });
 
-  it('allows owner == verifier when the room has exactly one eligible agent', async () => {
+  it('refuses owner == verifier even when the room has exactly one eligible agent', async () => {
+    // A solo submission now waits for an independent reviewer
+    // (reviewStatus waiting_for_verifier) instead of reviewing itself.
     installFakeRedis();
     const client = createClient(ENV);
     await createTask(client, CODE, { title: 'Solo', owner: 'Qwen', ownerClient: 'cc', verifier: 'GPT', verifierClient: 'cc', createdBy: 'Mod' });
-    const { task } = await reassignTaskRoles(
+    await expect(reassignTaskRoles(
       client, CODE, 'T-01',
       { owner: 'SoloAgent', ownerClient: 'cc', verifier: 'SoloAgent', verifierClient: 'cc' },
       MOD, 5000, 1,
-    );
-    expect(task.owner).toBe('SoloAgent');
-    expect(task.verifier).toBe('SoloAgent');
-    expect(task.roleHistory).toHaveLength(2);
+    )).rejects.toBeInstanceOf(TaskStateError);
   });
 
   it('rejects reassignment of a done task — completed work is locked', async () => {

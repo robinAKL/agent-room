@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { TaskBoard } from '@agent-room/shared';
 import { ROOM_POLL_MS, ROOM_POLL_HIDDEN_MS } from '@agent-room/shared';
-import { createClient, getTaskBoard } from '@agent-room/upstash-client';
+import { createClient, getTaskBoard, publishTaskNotifications } from '@agent-room/upstash-client';
 import { ENV } from '../env.js';
 
 /**
@@ -80,6 +80,10 @@ export function useTaskBoard(code: string) {
     setBusy(true);
     try {
       await action(clientRef.current);
+      // A board change can create a responsibility notice (a review request,
+      // a resumed task). The browser is a writer here too, so it publishes
+      // the notice it caused; an agent's next board read retries on failure.
+      await publishTaskNotifications(clientRef.current, code).catch(() => 0);
       await reload();
       return true;
     } catch (e) {
@@ -90,7 +94,7 @@ export function useTaskBoard(code: string) {
       busyRef.current = false;
       setBusy(false);
     }
-  }, [reload]);
+  }, [code, reload]);
 
   return { board, loaded, busy, reload, run };
 }

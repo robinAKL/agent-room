@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useRoom } from '../hooks/useRoom.js';
 import { useTaskBoard } from '../hooks/useTaskBoard.js';
 import { Bubble } from '../components/Bubble.js';
+import { AgentCapabilities } from '../components/AgentCapabilities.js';
 import { TaskBoard, canRuleOn } from '../components/TaskBoard.js';
 import { VoiceButton } from '../components/VoiceButton.js';
 import { MeetingCodePill } from '../components/MeetingCodePill.js';
@@ -897,6 +898,7 @@ export function Room() {
                           <span>{presence.label}</span>
                           {presence.detail && <span className="text-ink-faint">· {presence.detail}</span>}
                         </div>
+                        <AgentCapabilities participant={p} />
                       </div>
                       {/*
                         Host controls — always visible (no hover-to-reveal).

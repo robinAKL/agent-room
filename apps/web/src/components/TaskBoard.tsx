@@ -6,10 +6,12 @@ import {
   cancelTask,
   createTask,
   reassignTaskRoles,
+  resumeTask,
   updateTask,
   verifyTask,
 } from '@agent-room/upstash-client';
 import type { useTaskBoard } from '../hooks/useTaskBoard.js';
+import { TaskTimeline } from './TaskTimeline.js';
 
 interface Props {
   code: string;
@@ -57,20 +59,42 @@ export function partitionTasks(tasks: Task[]): { open: Task[]; closed: Task[] } 
 }
 
 /**
+ * The reviewer line on a card. Says why a review has nobody on it instead of
+ * leaving the line blank, and names who actually ruled once it is done.
+ */
+export function taskReviewLabel(task: Task): string {
+  if (task.state === 'done' && task.verdict?.by) return `Verified by @${task.verdict.by}`;
+  if (task.state === 'awaiting_review' && task.reviewStatus === 'waiting_for_capability') {
+    return `Reviewer @${task.verifier ?? '—'} lacks a requirement`;
+  }
+  if (task.state === 'awaiting_review' && !task.verifier?.trim()) return 'Waiting for an independent reviewer';
+  if (!task.verifier?.trim()) return 'Assigned on submission';
+  return `@${task.verifier}${task.reviewStatus === 'verifier_offline' ? ' · offline' : ''}`;
+}
+
+/** An explicit owner/review wait that has not been resolved yet. */
+export function openWait(task: Task): NonNullable<Task['waiting']> | undefined {
+  return task.waiting && task.waiting.resumedAt === undefined ? task.waiting : undefined;
+}
+
+/**
  * Whether this viewer may rule on a task, mirroring verifyTask's server-side
  * guards: only 'awaiting_review' is rulable, the owner never rules on their
- * own delivery, and a designated verifier excludes everyone else. Kept in sync
- * deliberately so the UI never renders an Approve button the server rejects.
+ * own delivery, an open review wait must be resolved first, and a designated
+ * verifier excludes everyone else — except the host, who may rule from the
+ * board (verifyTask's hostOverride). Kept in sync deliberately so the UI never
+ * renders an Approve button the server rejects.
  */
-export function canRuleOn(task: Task, viewer: { name: string; client: ClientKind }, ended: boolean): boolean {
+export function canRuleOn(task: Task, viewer: { name: string; client: ClientKind }, ended: boolean, isHost = false): boolean {
   if (ended || task.state !== 'awaiting_review') return false;
+  if (openWait(task)) return false;
   // Identity is (name, client) everywhere in this app, and a room can hold
   // both "Robin - web" and "Robin - cc". Matching on name alone hid Approve
   // from a host who shares a display name with the agent that owns the task.
   // An unrecorded client matches, same direction the server takes.
   if (task.owner === viewer.name
     && (task.ownerClient === undefined || task.ownerClient === viewer.client)) return false;
-  if (task.verifier && !(task.verifier === viewer.name
+  if (task.verifier && !isHost && !(task.verifier === viewer.name
     && (task.verifierClient === undefined || task.verifierClient === viewer.client))) return false;
   return true;
 }
@@ -84,10 +108,11 @@ export function TaskBoard({ code, me, isHost, ended, agents, artifacts, canExpor
   const { board, loaded, busy, run } = taskBoard;
   const [composing, setComposing] = useState(false);
   const [showClosed, setShowClosed] = useState(false);
+  const [view, setView] = useState<'board' | 'timeline'>('board');
 
   const tasks = board?.tasks ?? [];
   const { open, closed } = partitionTasks(tasks);
-  const needsMe = open.filter(t => canRuleOn(t, { name: me.name, client: 'web' }, ended)).length;
+  const needsMe = open.filter(t => canRuleOn(t, { name: me.name, client: 'web' }, ended, isHost)).length;
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -107,6 +132,23 @@ export function TaskBoard({ code, me, isHost, ended, agents, artifacts, canExpor
             </span>
           )}
         </div>
+        {tasks.length > 0 && (
+          <div className="mt-3 flex gap-1.5" role="group" aria-label="Task views">
+            {(['board', 'timeline'] as const).map(value => (
+              <button
+                key={value}
+                type="button"
+                aria-pressed={view === value}
+                onClick={() => setView(value)}
+                className={`${CTRL} flex-1 border ${view === value
+                  ? 'border-accent-tint-border bg-accent-tint text-accent'
+                  : 'border-border bg-surface-softer text-ink-muted'}`}
+              >
+                {value === 'board' ? 'Board' : 'Timeline'}
+              </button>
+            ))}
+          </div>
+        )}
         {!ended && (
           <button
             type="button"
@@ -139,6 +181,8 @@ export function TaskBoard({ code, me, isHost, ended, agents, artifacts, canExpor
           <BoardSkeleton />
         ) : tasks.length === 0 ? (
           <EmptyBoard hasAgents={agents.length > 0} />
+        ) : view === 'timeline' ? (
+          <TaskTimeline tasks={tasks} filterable />
         ) : (
           <div className="space-y-2.5">
             {open.map(task => (
@@ -207,15 +251,19 @@ function TaskCard({ task, me, isHost, ended, agents, busy, run, code, onMention 
   code: string;
   onMention: (text: string) => void;
 }) {
-  const [panel, setPanel] = useState<'none' | 'reject' | 'block' | 'assign'>('none');
+  const [panel, setPanel] = useState<'none' | 'reject' | 'block' | 'assign' | 'resume'>('none');
   const [note, setNote] = useState('');
   const tone = STATE_TONE[task.state];
 
   const iAmOwner = task.owner === me.name
     && (task.ownerClient === undefined || task.ownerClient === 'web');
-  const canRule = canRuleOn(task, { name: me.name, client: 'web' }, ended);
+  const canRule = canRuleOn(task, { name: me.name, client: 'web' }, ended, isHost);
+  const wait = openWait(task);
   const canBlock = !ended && (isHost || iAmOwner) && (task.state === 'in_progress' || task.state === 'todo');
-  const canReopen = !ended && isHost
+  // A recorded wait is released with a resolution, not a bare reopen.
+  const canResume = !ended && !!wait
+    && (isHost || (wait.waitingFor?.trim().toLowerCase() === me.name.trim().toLowerCase()));
+  const canReopen = !ended && isHost && !wait
     && (task.state === 'blocked' || task.state === 'rejected' || task.state === 'awaiting_review');
   const canAssign = !ended && isHost && !CLOSED.has(task.state);
   const canCancel = !ended && isHost && !CLOSED.has(task.state)
@@ -247,9 +295,18 @@ function TaskCard({ task, me, isHost, ended, agents, busy, run, code, onMention 
             </div>
             <div className="flex gap-1">
               <dt className="text-ink-faint">Verifier</dt>
-              <dd className="font-semibold text-ink-muted break-all">{task.verifier ?? 'any peer'}</dd>
+              <dd className="font-semibold text-ink-muted break-all">{taskReviewLabel(task)}</dd>
             </div>
           </dl>
+          {task.state === 'awaiting_review' && task.reviewReceipt && (
+            <p className="mt-1 text-[11px] text-ink-soft">
+              Review {task.reviewReceipt.startedAt !== undefined ? 'accepted' : 'acknowledged'} by @{task.reviewReceipt.by}
+            </p>
+          )}
+          {task.state === 'awaiting_review' && task.reviewReadiness && (
+            <p className="mt-1 text-[11px] text-amber-800 break-words">Review needs: {task.reviewReadiness}</p>
+          )}
+          <ExecutionLine task={task} />
 
           {task.dod && (
             <p className="mt-2 rounded-lg bg-surface-softer px-2.5 py-2 text-[12px] leading-relaxed text-ink-muted break-words">
@@ -264,7 +321,13 @@ function TaskCard({ task, me, isHost, ended, agents, busy, run, code, onMention 
           {task.state === 'awaiting_review' && (task.readinessNote || task.evidence) && (
             <ReviewEvidence task={task} />
           )}
-          {task.state === 'blocked' && task.blocked && (
+          {wait ? (
+            <Callout
+              tone="rose"
+              title={`${wait.scope === 'review' ? 'Review waiting' : 'Waiting'} · ${wait.reasonCode.replaceAll('_', ' ')}${wait.waitingFor ? ` · needs @${wait.waitingFor}` : ''}`}
+              body={`${wait.reason}\nResume when: ${wait.resumeWhen}`}
+            />
+          ) : task.state === 'blocked' && task.blocked && (
             <Callout tone="rose" title={`Blocked by ${task.blocked.by}`} body={task.blocked.reason} />
           )}
           {task.verdict && CLOSED.has(task.state) && task.verdict.note && (
@@ -283,7 +346,7 @@ function TaskCard({ task, me, isHost, ended, agents, busy, run, code, onMention 
                     type="button"
                     disabled={busy}
                     onClick={() => void run(
-                      c => verifyTask(c, code, task.id, { name: me.name, client: 'web' }, 'done', undefined),
+                      c => verifyTask(c, code, task.id, { name: me.name, client: 'web' }, 'done', undefined, Date.now(), { hostOverride: isHost }),
                       'Approve failed',
                     )}
                     className={`${CTRL} bg-emerald-600 text-white hover:bg-emerald-700`}
@@ -299,6 +362,16 @@ function TaskCard({ task, me, isHost, ended, agents, busy, run, code, onMention 
                     Reject
                   </button>
                 </>
+              )}
+              {canResume && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => setPanel('resume')}
+                  className={`${CTRL} border border-border bg-surface-softer text-ink-muted hover:border-accent/40 hover:text-accent`}
+                >
+                  Resume
+                </button>
               )}
               {canReopen && (
                 <button
@@ -370,9 +443,10 @@ function TaskCard({ task, me, isHost, ended, agents, busy, run, code, onMention 
           ) : (
             <NotePanel
               id={`task-note-${task.id}`}
-              label={panel === 'reject' ? 'What has to change before this passes?' : 'What exactly is missing?'}
-              submitLabel={panel === 'reject' ? 'Reject task' : 'Mark blocked'}
-              destructive
+              label={panel === 'reject' ? 'What has to change before this passes?'
+                : panel === 'resume' ? 'How was the missing condition met?' : 'What exactly is missing?'}
+              submitLabel={panel === 'reject' ? 'Reject task' : panel === 'resume' ? 'Resume task' : 'Mark blocked'}
+              destructive={panel !== 'resume'}
               value={note}
               onChange={setNote}
               busy={busy}
@@ -380,9 +454,11 @@ function TaskCard({ task, me, isHost, ended, agents, busy, run, code, onMention 
               onSubmit={async () => {
                 const ok = await run(
                   c => panel === 'reject'
-                    ? verifyTask(c, code, task.id, { name: me.name, client: 'web' }, 'rejected', note.trim())
-                    : blockTask(c, code, task.id, { name: me.name, client: 'web' }, note.trim()),
-                  panel === 'reject' ? 'Reject failed' : 'Block failed',
+                    ? verifyTask(c, code, task.id, { name: me.name, client: 'web' }, 'rejected', note.trim(), Date.now(), { hostOverride: isHost })
+                    : panel === 'resume'
+                      ? resumeTask(c, code, task.id, { name: me.name, client: 'web' }, note.trim(), Date.now(), isHost)
+                      : blockTask(c, code, task.id, { name: me.name, client: 'web' }, note.trim()),
+                  panel === 'reject' ? 'Reject failed' : panel === 'resume' ? 'Resume failed' : 'Block failed',
                 );
                 if (ok) closePanel();
               }}
@@ -391,6 +467,46 @@ function TaskCard({ task, me, isHost, ended, agents, busy, run, code, onMention 
         </div>
       </div>
     </article>
+  );
+}
+
+/** Fenced-execution state of the current attempt, when the task has one. */
+export function executionSummary(task: Task, now = Date.now()): string | null {
+  const exec = task.execution;
+  if (!exec) return null;
+  const attempt = task.attempts?.find(a => a.id === exec.attemptId);
+  const count = task.attempts?.length ?? 0;
+  const tries = count > 1 ? ` · attempt ${count}` : '';
+  if (exec.decisionRequired) return `Needs a reopen/cancel decision${tries}`;
+  if (attempt?.status === 'running' && task.lease && task.lease.status === 'active' && task.lease.expiresAt > now) {
+    return `Executing · @${attempt.name}${tries}`;
+  }
+  if (exec.recoveryRequired) return `Execution ${attempt?.endReason?.replaceAll('_', ' ') ?? 'ended'} · needs recovery${tries}`;
+  return attempt ? `Execution ${attempt.status}${tries}` : null;
+}
+
+function ExecutionLine({ task }: { task: Task }) {
+  const line = executionSummary(task);
+  const [open, setOpen] = useState(false);
+  const events = task.timeline?.length ?? 0;
+  if (!line && !events) return null;
+  return (
+    <div className="mt-1 min-w-0 text-[11px] text-ink-soft">
+      {line && <p className="break-words">{line}</p>}
+      {events > 0 && (
+        <>
+          <button
+            type="button"
+            onClick={() => setOpen(v => !v)}
+            aria-expanded={open}
+            className="mt-1 font-semibold underline underline-offset-2"
+          >
+            {open ? 'Hide activity' : `Activity (${events})`}
+          </button>
+          {open && <div className="mt-2"><TaskTimeline tasks={[task]} /></div>}
+        </>
+      )}
+    </div>
   );
 }
 
@@ -441,7 +557,7 @@ function Callout({ tone, title, body }: { tone: 'emerald' | 'rose'; title: strin
   return (
     <div className={`mt-2 rounded-lg border p-2.5 ${skin}`}>
       <div className="text-[11px] font-bold">{title}</div>
-      <p className="mt-0.5 text-[12px] leading-relaxed break-words">{body}</p>
+      <p className="mt-0.5 whitespace-pre-line text-[12px] leading-relaxed break-words">{body}</p>
     </div>
   );
 }

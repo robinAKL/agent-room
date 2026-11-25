@@ -224,3 +224,116 @@ describe('board inbox on join and listen', () => {
     expect(res.yourTasks).toBeUndefined();
   });
 });
+
+// Ported from the hosted deployment's api/mcp.taskInbox.test.ts (#747, #748, #749).
+describe('waits, fenced execution and task history over MCP', () => {
+  beforeEach(() => { listMessages.mockReset(); listMessages.mockResolvedValue([]); });
+
+  it('keeps blocked owner work waiting instead of issuing an execute directive', async () => {
+    const { callTool } = await import('./_mcpTools.js');
+    const client = { post: vi.fn(async () => ({ board: { tasks: [{ id: 'T-WAIT', state: 'blocked', owner: 'Codex',
+      blocked: { reason: 'Waiting for user login' } }] } })) } as never;
+    const res = body(await callTool(client, 'full', 'room_join', { code: room.code, name: 'Codex' }));
+    expect(res.nextAction).toMatchObject({ kind: 'task_wait', tool: 'room_listen' });
+    expect(res.yourTasks.current).toEqual([]);
+    expect(res.hint).not.toContain('CURRENT WORK: T-WAIT');
+  });
+
+  it('exposes wait/resume and returns a listening directive after a successful wait', async () => {
+    const { callTool, listTools } = await import('./_mcpTools.js');
+    const schema = listTools('full').find(t => t.name === 'room_task')!.inputSchema as any;
+    expect(schema.properties.action.enum).toEqual(expect.arrayContaining(['wait', 'block', 'resume', 'ack', 'review_start',
+      'capabilities', 'renew', 'recover', 'release', 'handoff', 'history', 'update']));
+    expect(schema.properties.seatKey).toBeDefined();
+    const waiting = { scope: 'review', reason: 'No access', resumeWhen: 'Access restored', at: 1, by: 'Codex', byClient: 'cc' };
+    const task = { id: 'T-01', state: 'awaiting_review', owner: 'Bystander', verifier: 'Codex', waiting };
+    const post = vi.fn(async () => ({ task, board: { tasks: [task] } }));
+    const res = body(await callTool({ post } as never, 'full', 'room_task', { code: room.code, name: 'Codex',
+      action: 'wait', id: task.id, scope: 'review', reasonCode: 'missing_credential', reason: 'No access', resumeWhen: 'Access restored' }));
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ action: 'taskWait', scope: 'review' }));
+    expect(res.nextAction).toMatchObject({ kind: 'task_wait', tool: 'room_listen' });
+    expect(res.yourTasks.toVerify).toEqual([]);
+  });
+
+  it('asks a reviewer to acknowledge the current review event before ruling', async () => {
+    const { callTool } = await import('./_mcpTools.js');
+    const task = { id: 'T-05', state: 'awaiting_review', owner: 'Bystander', verifier: 'Codex',
+      notification: { id: 'n-1', kind: 'review_requested', target: 'Codex', at: 1 } };
+    const res = body(await callTool({ post: vi.fn(async () => ({ board: { tasks: [task] } })) } as never, 'full', 'room_join',
+      { code: room.code, name: 'Codex' }));
+    expect(res.nextAction.startReview).toMatchObject({ tool: 'room_task', arguments: { action: 'review_start', id: 'T-05', notificationId: 'n-1' } });
+    expect(res.yourTasks.reviewEvents).toEqual({ 'T-05': 'n-1' });
+  });
+
+  it('claims with the seatKey and forwards the attempt on submit', async () => {
+    const { callTool } = await import('./_mcpTools.js');
+    const task = { id: 'T-01', owner: 'Codex', state: 'in_progress', execution: { attemptId: 'attempt-1', recoveryRequired: false }, lease: { expiresAt: Date.now() + 900_000 } };
+    const post = vi.fn(async () => ({ task, board: { tasks: [task] } }));
+    const claimed = body(await callTool({ post } as never, 'full', 'room_task', { code: room.code, name: 'Codex', id: task.id, action: 'claim', seatKey: 'private-seat' }));
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ action: 'taskClaim', seatKey: 'private-seat' }));
+    expect(claimed.workNext.instruction).toContain('attempt-1');
+    expect(claimed.renewExecution.arguments).toMatchObject({ action: 'renew', attemptId: 'attempt-1' });
+    await callTool({ post } as never, 'full', 'room_task', { code: room.code, name: 'Codex', id: task.id, action: 'submit', seatKey: 'private-seat',
+      attemptId: 'attempt-1', fileListing: 'x.md', fileExcerpt: 'Report', checks: 'Checked' });
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ action: 'taskSubmit', attemptId: 'attempt-1', seatKey: 'private-seat' }));
+  });
+
+  it('turns a missing seat proof into a hint that fixes the same call', async () => {
+    const { callTool } = await import('./_mcpTools.js');
+    const { RemoteRoomApiError } = await import('./_mcpRoomClient.js');
+    const post = vi.fn(async () => { throw new RemoteRoomApiError('no proof', 409, 'task_execution_identity_required'); });
+    const missing = body(await callTool({ post } as never, 'full', 'room_task', { code: room.code, name: 'Codex', id: 'T-01', action: 'claim' }));
+    expect(missing).toMatchObject({ error: 'task_execution_identity_required' });
+    expect(missing.hint).toContain('Retry this SAME room_task call with seatKey');
+    const wrong = body(await callTool({ post } as never, 'full', 'room_task', { code: room.code, name: 'Codex', id: 'T-01', action: 'claim', seatKey: 'stale' }));
+    expect(wrong.hint).toContain('does not match the seat');
+  });
+
+  it('offers explicit recovery for an expired execution rather than asking it to keep executing', async () => {
+    const { callTool } = await import('./_mcpTools.js');
+    const task = { id: 'T-OLD', owner: 'Codex', state: 'in_progress', execution: { attemptId: 'old', recoveryRequired: true },
+      lease: { status: 'expired', expiresAt: Date.now() - 1 }, attempts: [{ id: 'old', status: 'interrupted' }] };
+    const post = vi.fn(async () => ({ board: { tasks: [task] } }));
+    const result = body(await callTool({ post } as never, 'full', 'room_join', { code: room.code, name: 'Codex' }));
+    expect(result.nextAction).toMatchObject({ kind: 'task_recovery', action: 'recover', taskId: 'T-OLD' });
+    expect(result.yourTasks.current).toEqual([]);
+  });
+});
+
+describe('task history context and pagination', () => {
+  const events = [1, 2, 3].map(index => ({ id: `event-${index}`, kind: 'state_changed', at: index,
+    recordedAt: index, boardVersion: index, source: 'server' }));
+  const withHistory = { ...BOARD.tasks[0], timeline: events, timelineDropped: 4 };
+  const historyClient = () => ({ post: vi.fn(async () => ({ board: { tasks: [withHistory] }, task: withHistory })) }) as never;
+
+  it('omits full timelines from normal list and mutation replies', async () => {
+    const { callTool } = await import('./_mcpTools.js');
+    const listed = body(await callTool(historyClient(), 'full', 'room_task', { code: room.code, action: 'list' }));
+    expect(listed.board.tasks[0].timeline).toBeUndefined();
+    expect(listed.board.tasks[0].state).toBe('awaiting_review');
+    const updated = body(await callTool(historyClient(), 'full', 'room_task', { code: room.code, action: 'update', name: 'Codex', id: 'T-02', title: 'New title' }));
+    expect(updated.task.timeline).toBeUndefined();
+    expect(withHistory.timeline).toHaveLength(3);
+  });
+
+  it('returns explicit history newest first with a stable event cursor and retention information', async () => {
+    const { callTool } = await import('./_mcpTools.js');
+    const first = body(await callTool(historyClient(), 'full', 'room_task', { code: room.code, action: 'history', id: 'T-02', limit: 2 }));
+    expect(first.events.map((event: { id: string }) => event.id)).toEqual(['event-3', 'event-2']);
+    expect(first.nextBeforeEventId).toBe('event-2');
+    expect(first.olderEventsDropped).toBe(4);
+    const second = body(await callTool(historyClient(), 'full', 'room_task', { code: room.code, action: 'history', id: 'T-02', limit: 2, beforeEventId: first.nextBeforeEventId }));
+    expect(second.events.map((event: { id: string }) => event.id)).toEqual(['event-1']);
+    expect(second.nextBeforeEventId).toBeUndefined();
+  });
+
+  it('rejects invalid limits and stale cursors rather than silently skipping activity', async () => {
+    const { callTool } = await import('./_mcpTools.js');
+    for (const limit of [0, 51, 1.5, '10']) {
+      const result = body(await callTool(historyClient(), 'full', 'room_task', { code: room.code, action: 'history', id: 'T-02', limit }));
+      expect(result.error).toBe('bad_request');
+    }
+    const stale = body(await callTool(historyClient(), 'full', 'room_task', { code: room.code, action: 'history', id: 'T-02', beforeEventId: 'trimmed' }));
+    expect(stale.error).toBe('history_cursor_expired');
+  });
+});

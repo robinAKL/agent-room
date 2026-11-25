@@ -14,10 +14,31 @@
 //   - verifyTask is the ONLY way to reach 'done' / 'rejected', and it rejects
 //     (NotVerifierError) anyone who is not the task's designated verifier — and
 //     always rejects the owner verifying their own task (OwnerCannotVerifyError).
-import type { ClientKind, SubTask, Task, TaskBoard, TaskEvidence, TaskRoleChange, TaskState } from '@agent-room/shared';
-import { ROOM_TTL_SECONDS, TASK_BLOCK_DEMOTE_THRESHOLD } from '@agent-room/shared';
+import type { ClientKind, Room, SubTask, Task, TaskBoard, TaskEvidence, TaskRoleChange, TaskState, TaskWaitReason } from '@agent-room/shared';
+import {
+  ROOM_TTL_SECONDS,
+  TASK_BLOCK_DEMOTE_THRESHOLD,
+  activeTaskLease,
+  capabilityGaps,
+  currentCapabilities,
+  normalizeTaskRequirements,
+  participantMemberId,
+  recordTaskTimeline,
+  taskLeaseTtl,
+} from '@agent-room/shared';
 import type { UpstashClient } from './client.js';
 import { ConcurrencyError, UpstashError } from './errors.js';
+import { applyTaskPolicy, type TaskRoster } from './taskPolicy.js';
+import {
+  assertTaskExecution,
+  currentAttempt,
+  executionActor,
+  finishTaskAttempt,
+  reconcileTaskExecution,
+  startTaskAttempt,
+  TaskExecutionError,
+  type TaskExecutionRequest,
+} from './taskExecution.js';
 
 export class TaskNotFoundError extends UpstashError {
   constructor(id: string) { super(`Task ${id} not found`); this.name = 'TaskNotFoundError'; }
@@ -100,8 +121,8 @@ function taskBoardKey(code: string): string {
 // deploy doesn't leak it forever.
 const BOARD_ROOMS_KEY = 'task-board:rooms';
 
-async function roomRetentionSeconds(client: UpstashClient, code: string): Promise<number> {
-  const raw = await client.command<string | null>(['GET', `room:${code}`]);
+async function roomRetentionSeconds(client: UpstashClient, code: string, known?: string | null): Promise<number> {
+  const raw = known !== undefined ? known : await client.command<string | null>(['GET', `room:${code}`]);
   if (!raw) return ROOM_TTL_SECONDS;
   try {
     const value = (JSON.parse(raw) as { retentionSeconds?: unknown }).retentionSeconds;
@@ -164,13 +185,65 @@ const CAS_SCRIPT =
   "redis.call('SET', KEYS[1], ARGV[3], 'EX', tonumber(ARGV[4]))\n" +
   "return 1";
 
+// Execution-protected variant (fenced claim/submit/renew/recover/handoff).
+// Same CAS, plus two checks inside the same script: the room record is still
+// exactly the snapshot the mutator authorised against (a removed or replaced
+// seat cannot commit), and the task's execution lease is still in the state
+// the caller relied on, using Redis's own clock. -1 = room changed or closed,
+// -2 = lease timing changed.
+export const GUARDED_CAS_SCRIPT =
+  "-- task-board-guarded-cas\n" +
+  "if (redis.call('GET', KEYS[2]) or '') ~= ARGV[5] then return -1 end\n" +
+  "local room = cjson.decode(ARGV[5])\n" +
+  "if ARGV[7] ~= 'snapshot' and room.status ~= 'active' then return -1 end\n" +
+  "local clock = redis.call('TIME'); local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)\n" +
+  "if ARGV[6] and ARGV[6] ~= '' then\n" +
+  "  local guard = cjson.decode(ARGV[6]); local boardRaw = redis.call('GET', KEYS[1])\n" +
+  "  if boardRaw then for _, task in ipairs(cjson.decode(boardRaw).tasks or {}) do\n" +
+  "    if task.id == guard.id and task.execution and task.execution ~= cjson.null then\n" +
+  "      local sameSession = true\n" +
+  "      for _, attempt in ipairs(task.attempts or {}) do if attempt.id == task.execution.attemptId and attempt.roomSessionStartedAt and attempt.roomSessionStartedAt ~= cjson.null then sameSession = attempt.roomSessionStartedAt == (room.reactivatedAt or room.createdAt) end end\n" +
+  "      local lease = task.lease; local active = sameSession and lease and lease ~= cjson.null and lease.status == 'active' and tonumber(lease.expiresAt) > now\n" +
+  "      if guard.mode == 'active' and (not active or task.execution.attemptId ~= guard.attemptId) then return -2 end\n" +
+  "      if guard.mode == 'recover' and active then return -2 end\n" +
+  "    end\n" +
+  "  end end\n" +
+  "end\n" +
+  "local cur = redis.call('GET', KEYS[1])\n" +
+  "if ARGV[1] == 'absent' then\n" +
+  "  if cur then return 0 end\n" +
+  "else\n" +
+  "  if cur ~= ARGV[2] then return 0 end\n" +
+  "end\n" +
+  "redis.call('SET', KEYS[1], ARGV[3], 'EX', tonumber(ARGV[4]))\n" +
+  "return 1";
+
+type LeaseGuard = { id: string; attemptId?: string; mode: 'active' | 'recover' };
+
 async function casWriteTaskBoard(
   client: UpstashClient,
   code: string,
   expectedRaw: string | null,
   nextRaw: string,
+  roomRaw?: string | null,
+  guard?: { roomRaw: string; lease?: LeaseGuard; snapshotOnly?: boolean },
 ): Promise<boolean> {
-  const ttlSeconds = await roomRetentionSeconds(client, code);
+  const ttlSeconds = await roomRetentionSeconds(client, code, roomRaw);
+  if (guard) {
+    const res = Number(await client.command<number>([
+      'EVAL', GUARDED_CAS_SCRIPT, '2', taskBoardKey(code), `room:${code}`,
+      expectedRaw === null ? 'absent' : 'present',
+      expectedRaw ?? '',
+      nextRaw,
+      String(ttlSeconds),
+      guard.roomRaw,
+      guard.lease ? JSON.stringify(guard.lease) : '',
+      guard.snapshotOnly ? 'snapshot' : '',
+    ]));
+    if (res === -2) throw new TaskExecutionError('lease_not_active', 'Execution lease timing changed before commit. Read the current task and recover or renew explicitly.');
+    // -1: the room changed under us; the caller retries against a fresh snapshot.
+    return res === 1;
+  }
   const res = await client.command<number>([
     'EVAL', CAS_SCRIPT, '1', taskBoardKey(code),
     expectedRaw === null ? 'absent' : 'present',
@@ -181,18 +254,41 @@ async function casWriteTaskBoard(
   return Number(res) === 1;
 }
 
+function parseRoster(raw: string | null | undefined): TaskRoster | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Room;
+    return Array.isArray(parsed.participants) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 
 // CAS wrapper. The mutator returns the next board; it may throw to abort (e.g. a
 // validation error), which propagates out. On a write conflict we re-read the
 // fresh board and re-run the mutator, so a concurrent change is never clobbered.
+//
+// Every write also runs applyTaskPolicy (review assignment, waits, execution
+// reconciliation, notification intent) and records the task timeline, against
+// the room roster re-read on each attempt so a revoked seat is never used.
+// `guardRoom` makes the write fail unless the room is unchanged and active;
+// 'snapshot' only requires it unchanged (closed-room reconciliation).
 async function casTaskBoard(
   client: UpstashClient,
   code: string,
-  mutator: (current: TaskBoard) => TaskBoard,
+  mutator: (current: TaskBoard, room: TaskRoster | null) => TaskBoard | Promise<TaskBoard>,
+  guardRoom: boolean | 'snapshot' = false,
+  leaseGuard?: LeaseGuard,
 ): Promise<TaskBoard> {
   let lastError: unknown;
   for (let attempt = 0; attempt < CAS_MAX_ATTEMPTS; attempt++) {
+    const roomRaw = await client.command<string | null>(['GET', `room:${code}`]);
+    const room = parseRoster(roomRaw);
+    if (guardRoom && (!roomRaw || (guardRoom === true && room?.status !== 'active'))) {
+      throw new TaskExecutionError('room_closed', 'An active room is required for task execution.');
+    }
     const raw = await getTaskBoardRaw(client, code);
     let current: TaskBoard;
     if (raw === null) {
@@ -203,13 +299,53 @@ async function casTaskBoard(
     }
     let next: TaskBoard;
     try {
-      next = mutator(current);
+      next = await mutator(current, room);
     } catch (e) {
       if (e instanceof ConcurrencyError) { lastError = e; continue; }
       throw e;
     }
-    next.version = current.version + 1;
-    if (await casWriteTaskBoard(client, code, raw, JSON.stringify(next))) {
+    for (const task of next.tasks) {
+      const old = current.tasks.find(t => t.id === task.id);
+      const rolesChanged = !old || task.owner !== old.owner || task.verifier !== old.verifier
+        || task.ownerClient !== old.ownerClient || task.verifierClient !== old.verifierClient;
+      if (!rolesChanged) continue;
+      for (const value of [task.owner, task.verifier]) {
+        if (value !== undefined && !value.trim()) throw new TaskStateError('Task role names cannot be empty.');
+      }
+      if (task.owner && task.verifier && task.owner.trim().toLowerCase() === task.verifier.trim().toLowerCase()) {
+        throw new TaskStateError('Task owner and verifier must be different participants — a producer cannot verify their own delivery.');
+      }
+      if (room) {
+        // Canonicalise to the seated spelling and client kind, so later
+        // name/client gates compare against the real roster entry.
+        const seat = (name?: string) => room.participants.find(p => !!name && p.name.trim().toLowerCase() === name.trim().toLowerCase());
+        const owner = seat(task.owner);
+        const verifier = seat(task.verifier);
+        // A role named after somebody who is not in the room can never act on
+        // it. Only a newly set name is checked: a holder who has since left
+        // stays on record, and review policy reassigns their reviews.
+        for (const [role, name, found, before] of [['owner', task.owner, owner, old?.owner], ['verifier', task.verifier, verifier, old?.verifier]] as const) {
+          if (name && !found && name !== before) {
+            const here = room.participants.map(p => p.name).join(', ') || '(nobody)';
+            throw new TaskStateError(`The ${role} ${name} is not in this room. Pick one of: ${here}.`);
+          }
+        }
+        const canonical = { ...task, ...(owner ? { owner: owner.name, ownerClient: owner.client } : {}),
+          ...(verifier ? { verifier: verifier.name, verifierClient: verifier.client } : {}) };
+        next = { ...next, tasks: next.tasks.map(t => t.id === task.id ? canonical : t) };
+      }
+    }
+    const touchedAt = next.tasks.reduce((latest, t) => {
+      const old = current.tasks.find(x => x.id === t.id);
+      return old !== t ? Math.max(latest, t.updatedAt) : latest;
+    }, 0) || Date.now();
+    next = applyTaskPolicy(next, current, room, touchedAt);
+    if (next === current) return current;
+    const recordedAt = Date.now();
+    next = { ...next, version: current.version + 1, tasks: next.tasks.map(task =>
+      recordTaskTimeline(current.tasks.find(old => old.id === task.id), task, current.version + 1, recordedAt)) };
+    const guard = guardRoom ? { roomRaw: roomRaw!, lease: leaseGuard, snapshotOnly: guardRoom === 'snapshot' } : undefined;
+    if (await casWriteTaskBoard(client, code, raw, JSON.stringify(next), roomRaw, guard)) {
       return next;
     }
     // Lost the race — another writer changed the board between our read and
@@ -218,6 +354,19 @@ async function casTaskBoard(
     await sleep(20 + Math.floor(Math.random() * 50));
   }
   throw lastError instanceof ConcurrencyError ? lastError : new ConcurrencyError();
+}
+
+/**
+ * Repair historical unassigned reviews, offline reviewers and ended
+ * executions. A stable board costs one board read and one room read, no write.
+ */
+export async function reconcileTaskReviews(client: UpstashClient, code: string): Promise<TaskBoard | null> {
+  const board = await getTaskBoard(client, code);
+  if (!board) return null;
+  const roster = parseRoster(await client.command<string | null>(['GET', `room:${code}`]));
+  if (applyTaskPolicy(board, board, roster, Date.now()) === board) return board;
+  if (roster && board.tasks.some(task => task.execution)) return casTaskBoard(client, code, current => current, 'snapshot');
+  return casTaskBoard(client, code, current => current);
 }
 
 function findTask(board: TaskBoard, id: string): Task {
@@ -238,6 +387,7 @@ export interface CreateTaskInput {
   verifier?: string;
   verifierClient?: ClientKind;
   dod?: string;
+  requirements?: Task['requirements'];
   createdBy: string;
 }
 
@@ -256,6 +406,8 @@ export async function createTask(
   input: CreateTaskInput,
   now: number = Date.now(),
 ): Promise<{ board: TaskBoard; task: Task }> {
+  let requirements: Task['requirements'];
+  try { requirements = normalizeTaskRequirements(input.requirements); } catch (error) { throw new TaskStateError((error as Error).message); }
   // Validate before touching Redis so a bad creation fails fast. A task whose
   // designated verifier IS the owner would be self-verifiable, defeating the
   // whole evidence gate — verifyTask would then let the producer rule on their
@@ -279,6 +431,7 @@ export async function createTask(
       verifier: input.verifier,
       verifierClient: input.verifierClient,
       dod: input.dod,
+      ...(requirements ? { requirements } : {}),
       state: 'todo',
       createdBy: input.createdBy,
       createdAt: now,
@@ -288,7 +441,7 @@ export async function createTask(
   });
   // Index this room for the periodic board-review sweep (best-effort).
   await registerBoardRoom(client, code).catch(() => { /* best-effort */ });
-  return { board, task: created! };
+  return { board, task: findTask(board, created!.id) };
 }
 
 // A producer claims a task → 'in_progress'. Records ownership if not already set.
@@ -307,10 +460,12 @@ export async function claimTask(
   id: string,
   owner: { name: string; client: ClientKind },
   now: number = Date.now(),
+  execution?: TaskExecutionRequest,
 ): Promise<{ board: TaskBoard; task: Task }> {
   let updated: Task;
-  const board = await casTaskBoard(client, code, (current) => {
+  const board = await casTaskBoard(client, code, async (current, room) => {
     const task = findTask(current, id);
+    if (task.lease && !task.execution) throw new TaskExecutionError('legacy_lease', 'This task carries a fleet lease; do not overwrite it through the name-only claim path.');
     if (task.state === 'done' || task.state === 'rejected' || task.state === 'cancelled') {
       throw new TaskStateError(
         `Task ${id} is ${task.state}; reopen it (host Set state) before claiming.`,
@@ -330,8 +485,18 @@ export async function claimTask(
         `Task ${id} is in_progress under ${task.owner} — ask the host to reassign it instead of claiming it.`,
       );
     }
+    if (task.state === 'blocked') throw new TaskStateError(`Task ${id} is waiting; use room_task resume with a resolution before claiming it.`);
     if (claimerIsDesignatedVerifier(task, owner)) {
       throw new VerifierCannotClaimError(id, task.verifier!);
+    }
+    if (execution || task.execution || task.requirements?.owner) {
+      const actor = await executionActor(room, owner, execution);
+      if (task.execution) {
+        if (activeTaskLease(task.lease, now) && task.lease?.holderId === actor.memberId) return current;
+        throw new TaskExecutionError('recovery_required', 'Read task attempts and use recover with a resolution; claiming must not silently restart managed work.');
+      }
+      updated = startTaskAttempt(task, actor, now, execution?.ttlMs);
+      return { ...replaceTask(current, updated), lastProgressAt: now };
     }
     updated = {
       ...task,
@@ -341,8 +506,64 @@ export async function claimTask(
       updatedAt: now,
     };
     return { ...replaceTask(current, updated), lastProgressAt: now };
-  });
-  return { board, task: updated! };
+  }, !!execution);
+  return { board, task: findTask(board, id) };
+}
+
+/**
+ * Explicit execution operations on a fenced task: renew the lease, recover a
+ * new attempt after expiry or interruption, release it, or hand it to another
+ * seated agent. Every one needs the seatKey; renew/release/handoff also the
+ * current attemptId.
+ */
+export async function operateTaskExecution(client: UpstashClient, code: string, id: string,
+  actorInput: { name: string; client: ClientKind }, action: 'renew' | 'recover' | 'release' | 'handoff',
+  request: TaskExecutionRequest, options: { resolution?: string; to?: string } = {}, now = Date.now(),
+): Promise<{ board: TaskBoard; task: Task }> {
+  const board = await casTaskBoard(client, code, async (current, room) => {
+    let task = findTask(current, id);
+    const actor = await executionActor(room, actorInput, request);
+    task = reconcileTaskExecution(task, task, now, actor.roomSessionStartedAt);
+    if (task.execution?.decisionRequired) throw new TaskExecutionError('decision_required', 'This task needs an explicit reopen/cancel decision before execution can restart.');
+    if (!task.execution || !['in_progress', 'rejected'].includes(task.state)) throw new TaskExecutionError('not_running', 'This task has no recoverable execution; claim new work or resolve the recorded wait first.');
+    if (action === 'recover') {
+      if (activeTaskLease(task.lease, now)) {
+        if (task.lease!.holderId === actor.memberId) {
+          await assertTaskExecution(task, room, actorInput, { ...request, attemptId: task.execution.attemptId }, now);
+          return current;
+        }
+        throw new TaskExecutionError('lease_held', 'Another verified seat still holds this task. Ask for handoff or wait for expiry.');
+      }
+      if (!options.resolution?.trim()) throw new TaskExecutionError('resolution_required', 'Read the task evidence/history and explain what work you will recover.');
+      if (task.owner !== actor.name && currentAttempt(task)?.endReason === 'assignment_or_scope_changed') {
+        // An explicit reassignment names the intended next owner; expiry alone
+        // leaves the task available for a verified replacement to recover.
+        throw new TaskExecutionError('owner_required', 'This task was assigned for recovery by its named owner. Reassign it before a different owner takes over.');
+      }
+      task = finishTaskAttempt(task, 'interrupted', 'lease_expired', now);
+      const next = startTaskAttempt(task, actor, now, request.ttlMs);
+      const attempt = next.attempts![next.attempts!.length - 1]!;
+      next.attempts = next.attempts!.map(a => a.id === attempt.id ? { ...a, endReason: undefined, recoveryNote: options.resolution!.trim() } : a);
+      if (task.owner !== actor.name) next.roleHistory = [...(task.roleHistory ?? []), { by: actor.name, byClient: actor.client, at: now, field: 'owner', from: task.owner, to: actor.name }];
+      return { ...replaceTask(current, next), lastProgressAt: now };
+    }
+    await assertTaskExecution(task, room, actorInput, request, now, action === 'release' || action === 'handoff');
+    if (action === 'release') return replaceTask(current, finishTaskAttempt(task, 'released', 'holder_released', now));
+    if (action === 'renew') {
+      let ttl: number;
+      try { ttl = taskLeaseTtl(request.ttlMs); } catch { throw new TaskExecutionError('ttl_invalid', 'Invalid task lease TTL.'); }
+      return replaceTask(current, { ...task, lease: { ...task.lease!, expiresAt: now + ttl, renewedAt: now },
+        attempts: task.attempts!.map(a => a.id === task.execution!.attemptId ? { ...a, confirmedAt: now } : a) });
+    }
+    const recipient = room?.participants.find(p => p.name === options.to && p.client === 'cc' && p.canSpeak !== false);
+    const memberId = recipient && participantMemberId(recipient);
+    if (!recipient || !memberId || memberId === actor.memberId) throw new TaskExecutionError('handoff_target_invalid', 'Choose a different joined agent with a stable seat.');
+    task = finishTaskAttempt(task, 'interrupted', 'handed_off', now);
+    const next = startTaskAttempt(task, { name: recipient.name, client: recipient.client, memberId, participant: recipient, roomSessionStartedAt: actor.roomSessionStartedAt }, now, request.ttlMs);
+    next.roleHistory = [...(task.roleHistory ?? []), { by: actor.name, byClient: actor.client, at: now, field: 'owner', from: task.owner, to: recipient.name }];
+    return { ...replaceTask(current, next), lastProgressAt: now };
+  }, true, { id, attemptId: request.attemptId, mode: action === 'recover' ? 'recover' : 'active' });
+  return { board, task: findTask(board, id) };
 }
 
 // Moderator-mode reassignment: hand a blocked agent's task to a different agent.
@@ -391,7 +612,7 @@ export async function reassignTask(
     }
     return next;
   });
-  return { board, task: updated!, fromOwner, demoted, blocks };
+  return { board, task: findTask(board, updated!.id), fromOwner, demoted, blocks };
 }
 
 export interface ReassignTaskRolesPatch {
@@ -412,8 +633,8 @@ export interface ReassignTaskRolesPatch {
 // host or any joined room participant) — this function only enforces the
 // state machine:
 //   - terminal states ('done', 'rejected') are locked;
-//   - the RESULTING owner and verifier must differ when the room has more than
-//     one eligible agent (client === 'cc'); solo-agent rooms may self-review.
+//   - the RESULTING owner and verifier always differ, including solo rooms: a
+//     solo submission waits for a reviewer instead of reviewing itself.
 export async function reassignTaskRoles(
   client: UpstashClient,
   code: string,
@@ -421,7 +642,8 @@ export async function reassignTaskRoles(
   patch: ReassignTaskRolesPatch,
   actor: { name: string; client: ClientKind },
   now: number = Date.now(),
-  eligibleAgentCount?: number,
+  /** @deprecated Solo rooms no longer allow self-review; ignored. */
+  _eligibleAgentCount?: number,
 ): Promise<{ board: TaskBoard; task: Task }> {
   const newOwner = patch.owner?.trim();
   const newVerifier = patch.verifier?.trim();
@@ -438,14 +660,11 @@ export async function reassignTaskRoles(
       throw new TaskStateError(`Task ${id} is ${task.state} — reopen it before reassigning roles.`);
     }
     // Validate the RESULT of applying the patch — a new owner colliding with
-    // the existing verifier (or vice versa) is self-verifiable when another
-    // agent could verify. Solo-agent rooms (eligibleAgentCount === 1) may
-    // assign the same participant to both roles.
+    // the existing verifier (or vice versa) must not create self-review.
     const resultingOwner = newOwner ?? task.owner;
     const resultingVerifier = newVerifier ?? task.verifier;
     if (resultingOwner && resultingVerifier
-      && resultingOwner.trim().toLowerCase() === resultingVerifier.trim().toLowerCase()
-      && eligibleAgentCount !== 1) {
+      && resultingOwner.trim().toLowerCase() === resultingVerifier.trim().toLowerCase()) {
       throw new TaskStateError(
         `Task verifier (${resultingVerifier}) must be different from the owner (${resultingOwner}) — a producer cannot verify their own delivery.`,
       );
@@ -462,11 +681,12 @@ export async function reassignTaskRoles(
       ...(newOwner !== undefined ? { owner: newOwner, ownerClient: patch.ownerClient } : {}),
       ...(newVerifier !== undefined ? { verifier: newVerifier, verifierClient: patch.verifierClient } : {}),
       ...(audit.length ? { roleHistory: [...(task.roleHistory ?? []), ...audit] } : {}),
+      ...(newVerifier !== undefined && newVerifier !== task.verifier && task.state === 'awaiting_review' ? { reviewRequestedAt: now } : {}),
       updatedAt: now,
     };
     return { ...replaceTask(current, updated), lastProgressAt: now };
   });
-  return { board, task: updated! };
+  return { board, task: findTask(board, id) };
 }
 
 /** True when a task has submitted work that must be preserved until reopen. */
@@ -512,7 +732,7 @@ export async function cancelTask(
     };
     return { ...replaceTask(current, updated), lastProgressAt: now };
   });
-  return { board, task: updated! };
+  return { board, task: findTask(board, updated!.id) };
 }
 
 /**
@@ -558,6 +778,9 @@ function assertEvidenceComplete(e: Partial<TaskEvidence>): void {
  * nominal owner also stays submittable, same reasoning as the claim path.
  */
 function assertCanSubmit(task: Task, submitter: { name: string }): void {
+  if (task.state === 'blocked' || (task.waiting && task.waiting.resumedAt === undefined)) {
+    throw new TaskStateError(`Task ${task.id} is waiting; resolve the recorded wait with room_task resume before submitting.`);
+  }
   if (task.state === 'done') throw new TaskDoneImmutableError(task.id);
   if (task.state === 'cancelled') {
     throw new TaskStateError(
@@ -582,13 +805,16 @@ export async function submitTask(
   submitter: { name: string; client: ClientKind },
   evidence: Omit<TaskEvidence, 'submittedBy' | 'submittedClient' | 'at'>,
   now: number = Date.now(),
+  execution?: TaskExecutionRequest,
 ): Promise<{ board: TaskBoard; task: Task }> {
   // Validate before touching Redis so a bad submission fails fast.
   assertEvidenceComplete(evidence);
   let updated: Task;
-  const board = await casTaskBoard(client, code, (current) => {
+  const board = await casTaskBoard(client, code, async (current, room) => {
     const task = findTask(current, id);
     assertCanSubmit(task, submitter);
+    if (task.requirements?.owner && !task.execution) throw new TaskExecutionError('recovery_required', 'Claim a verified execution before submitting work with capability requirements.');
+    await assertTaskExecution(task, room, submitter, execution, now);
     const fullEvidence: TaskEvidence = {
       fileListing: evidence.fileListing,
       fileExcerpt: evidence.fileExcerpt,
@@ -605,11 +831,13 @@ export async function submitTask(
       ownerClient: task.ownerClient ?? submitter.client,
       state: 'awaiting_review',
       evidence: fullEvidence,
+      ...(task.execution ? { submittedAttemptId: task.execution.attemptId } : {}),
+      reviewRequestedAt: now,
       updatedAt: now,
     };
     return { ...replaceTask(current, updated), lastProgressAt: now };
-  });
-  return { board, task: updated! };
+  }, !!execution, execution ? { id, attemptId: execution.attemptId, mode: 'active' } : undefined);
+  return { board, task: findTask(board, id) };
 }
 
 // Light "ready for review" path for marker-driven hosted-agent rooms: the
@@ -625,30 +853,50 @@ export async function submitForReview(
   submitter: { name: string; client: ClientKind },
   note: string,
   now: number = Date.now(),
+  execution?: TaskExecutionRequest,
 ): Promise<{ board: TaskBoard; task: Task }> {
   const clean = note.trim();
   if (!clean) throw new TaskStateError('A readiness note is required to submit for review.');
   let updated: Task;
-  const board = await casTaskBoard(client, code, (current) => {
+  const board = await casTaskBoard(client, code, async (current, room) => {
     const task = findTask(current, id);
     assertCanSubmit(task, submitter);
+    if (task.requirements?.owner && !task.execution) throw new TaskExecutionError('recovery_required', 'Claim a verified execution before submitting work with capability requirements.');
+    await assertTaskExecution(task, room, submitter, execution, now);
     updated = {
       ...task,
       owner: task.owner ?? submitter.name,
       ownerClient: task.ownerClient ?? submitter.client,
       state: 'awaiting_review',
       readinessNote: clean,
+      ...(task.execution ? { submittedAttemptId: task.execution.attemptId } : {}),
+      reviewRequestedAt: now,
       updatedAt: now,
     };
     return { ...replaceTask(current, updated), lastProgressAt: now };
-  });
-  return { board, task: updated! };
+  }, !!execution, execution ? { id, attemptId: execution.attemptId, mode: 'active' } : undefined);
+  return { board, task: findTask(board, id) };
+}
+
+export interface VerifyTaskOptions {
+  /** Agent reviewers of fenced or capability-constrained tasks prove their seat. */
+  reviewerProof?: TaskExecutionRequest;
+  /**
+   * The room host ruling from the web board. The caller has already
+   * established that the viewer is the host; the owner still cannot rule on
+   * their own delivery.
+   */
+  hostOverride?: boolean;
 }
 
 // The ONLY path to 'done' / 'rejected'. Enforces:
 //   - the task is awaiting review (you cannot verify thin air);
 //   - the caller is not the owner (no self-verification, ever);
-//   - if a verifier is designated, the caller must be that verifier.
+//   - if a verifier is designated, the caller must be that verifier (or the
+//     host ruling from the board);
+//   - an open review wait is resolved first;
+//   - agent reviewers of fenced or constrained tasks prove their seat and meet
+//     the review requirements.
 export async function verifyTask(
   client: UpstashClient,
   code: string,
@@ -657,26 +905,35 @@ export async function verifyTask(
   verdict: 'done' | 'rejected',
   note: string | undefined,
   now: number = Date.now(),
+  options: VerifyTaskOptions = {},
 ): Promise<{ board: TaskBoard; task: Task }> {
   let updated: Task;
-  const board = await casTaskBoard(client, code, (current) => {
+  const board = await casTaskBoard(client, code, async (current, room) => {
     const task = findTask(current, id);
+    if (verifier.client === 'cc' && (task.execution || task.requirements?.review || options.reviewerProof)) {
+      const actor = await executionActor(room, verifier, options.reviewerProof);
+      const gaps = capabilityGaps(task.requirements?.review, currentCapabilities(actor.participant));
+      if (gaps.length) throw new TaskExecutionError('capability_required', `Review requirements are not met: ${gaps.join('; ')}`);
+    }
     if (task.state === 'done' || task.state === 'cancelled') throw new TaskDoneImmutableError(id);
     if (task.state !== 'awaiting_review') {
       throw new TaskStateError(`Task ${id} is '${task.state}', not 'awaiting_review' — nothing to verify. The producer must submit evidence first.`);
+    }
+    if (task.waiting && task.waiting.resumedAt === undefined) {
+      throw new TaskStateError(`Task ${id} has an open review wait; resolve it with room_task resume before issuing a verdict.`);
     }
     // Owner can never verify their own delivery. When ownerClient was never
     // recorded (createTask accepts an owner name alone), the safe direction is
     // to BLOCK on a bare name match — otherwise the producer could self-verify
     // just because the client kind was missing.
-    if (task.owner && task.owner === verifier.name
+    if (task.owner && sameAgentName(task.owner, verifier.name)
       && (task.ownerClient === undefined || task.ownerClient === verifier.client)) {
       throw new OwnerCannotVerifyError(id);
     }
     // If a verifier is designated, only they may rule. When verifierClient was
     // never recorded, match on name alone — requiring an undefined client to
     // equal the caller's made such tasks permanently unverifiable.
-    if (task.verifier && !(task.verifier === verifier.name
+    if (task.verifier && !options.hostOverride && !(sameAgentName(task.verifier, verifier.name)
       && (task.verifierClient === undefined || task.verifierClient === verifier.client))) {
       throw new NotVerifierError(id, task.verifier);
     }
@@ -687,8 +944,8 @@ export async function verifyTask(
       updatedAt: now,
     };
     return { ...replaceTask(current, updated), lastProgressAt: now };
-  });
-  return { board, task: updated! };
+  }, !!options.reviewerProof && verifier.client === 'cc');
+  return { board, task: findTask(board, id) };
 }
 
 // Edit a task's mutable fields and/or correct its scope. This is the path the
@@ -702,6 +959,10 @@ export interface UpdateTaskInput {
   dod?: string;
   verifier?: string;
   verifierClient?: ClientKind;
+  /** Who made the change, for the verifier audit trail. */
+  actor?: { name: string; client: ClientKind };
+  /** Full replacement of the owner/review requirements (not a partial merge). */
+  requirements?: Task['requirements'];
   /** Reopen / re-scope only. Allowed: 'todo' | 'in_progress' | 'rejected'. */
   state?: Extract<TaskState, 'todo' | 'in_progress' | 'rejected'>;
 }
@@ -715,23 +976,153 @@ export async function updateTask(
   patch: UpdateTaskInput,
   now: number = Date.now(),
 ): Promise<{ board: TaskBoard; task: Task }> {
+  let requirements: Task['requirements'];
+  try { requirements = normalizeTaskRequirements(patch.requirements); } catch (error) { throw new TaskStateError((error as Error).message); }
   if (patch.state && !REOPENABLE_TARGET_STATES.has(patch.state)) {
     throw new TaskStateError(`updateTask cannot set state '${patch.state}'. Use submitTask (evidence) then verifyTask to reach 'awaiting_review'/'done'.`);
   }
-  let updated: Task;
   const board = await casTaskBoard(client, code, (current) => {
     const task = findTask(current, id);
-    updated = {
+    if (task.state === 'done') throw new TaskDoneImmutableError(id);
+    if (task.waiting && task.waiting.resumedAt === undefined && patch.state && patch.state !== task.state) {
+      throw new TaskStateError('Use room_task resume with a resolution note to release this wait.');
+    }
+    if ((patch.title === undefined || !patch.title.trim() || patch.title.trim() === task.title)
+      && (patch.dod === undefined || patch.dod === task.dod)
+      && (patch.requirements === undefined || JSON.stringify(requirements) === JSON.stringify(task.requirements))
+      && (patch.verifier === undefined || (patch.verifier === task.verifier && patch.verifierClient === task.verifierClient))
+      && (patch.state === undefined || patch.state === task.state)) return current;
+    const verifier = patch.verifier?.trim();
+    const updated: Task = {
       ...task,
       ...(patch.title !== undefined && patch.title.trim() ? { title: patch.title.trim() } : {}),
       ...(patch.dod !== undefined ? { dod: patch.dod } : {}),
-      ...(patch.verifier !== undefined ? { verifier: patch.verifier, verifierClient: patch.verifierClient } : {}),
+      ...(patch.requirements !== undefined ? { requirements } : {}),
+      ...(verifier !== undefined ? { verifier: verifier || undefined, verifierClient: verifier ? patch.verifierClient : undefined,
+        ...(verifier !== task.verifier ? { roleHistory: [...(task.roleHistory ?? []), {
+          by: patch.actor?.name ?? 'system', byClient: patch.actor?.client ?? 'cc', at: now,
+          field: 'verifier' as const, from: task.verifier, to: verifier || undefined,
+        }], ...(task.state === 'awaiting_review' ? { reviewRequestedAt: now } : {}) } : {}) } : {}),
       ...(patch.state ? { state: patch.state } : {}),
       updatedAt: now,
     };
     return { ...replaceTask(current, updated), lastProgressAt: now };
   });
-  return { board, task: updated! };
+  return { board, task: findTask(board, id) };
+}
+
+export interface WaitTaskInput {
+  scope: 'owner' | 'review';
+  reasonCode: TaskWaitReason;
+  reason: string;
+  resumeWhen: string;
+  waitingFor?: string;
+}
+
+const WAIT_REASONS = new Set<string>(['missing_user_input', 'missing_credential', 'tool_failure', 'dependency', 'other']);
+const sameActor = (name: string | undefined, client: ClientKind | undefined, actor: { name: string; client: ClientKind }) =>
+  !!name && name.trim().toLowerCase() === actor.name.trim().toLowerCase() && (!client || client === actor.client);
+
+/**
+ * The reviewer's explicit receipt (`ack`) or declared start (`review_start`).
+ * Publication of a notification never claims the agent read or executed it;
+ * this does, and only for the current reviewer and the current notice.
+ */
+export async function acknowledgeTaskReview(client: UpstashClient, code: string, id: string,
+  actor: { name: string; client: ClientKind }, started: boolean, notificationId?: string, now = Date.now(),
+  proof?: TaskExecutionRequest,
+): Promise<{ board: TaskBoard; task: Task }> {
+  const board = await casTaskBoard(client, code, async (current, room) => {
+    const task = findTask(current, id);
+    if (task.execution || task.requirements?.review || proof) {
+      const verified = await executionActor(room, actor, proof);
+      const gaps = capabilityGaps(task.requirements?.review, currentCapabilities(verified.participant));
+      if (gaps.length) throw new TaskExecutionError('capability_required', gaps.join('; '));
+    }
+    if (task.state !== 'awaiting_review' || !sameActor(task.verifier, task.verifierClient, actor)
+      || (task.waiting && task.waiting.resumedAt === undefined)) {
+      throw new TaskStateError('Only the current available reviewer can acknowledge or start this review.');
+    }
+    if (notificationId && notificationId !== task.notification?.id) throw new TaskStateError('This review notification has been superseded. Read the current inbox.');
+    const receipt = task.reviewReceipt;
+    if (receipt?.by === actor.name && receipt.notificationId === task.notification?.id && (!started || receipt.startedAt !== undefined)) return current;
+    return replaceTask(current, { ...task, reviewReceipt: { by: actor.name, byClient: actor.client,
+      notificationId: task.notification?.id, readAt: receipt?.readAt ?? now,
+      ...(started ? { startedAt: receipt?.startedAt ?? now } : {}) } });
+  }, !!proof);
+  return { board, task: findTask(board, id) };
+}
+
+/**
+ * Declare that owner work or a review cannot proceed until something specific
+ * happens. Owner waits move the task to `blocked`; review waits keep it in
+ * awaiting_review with its evidence and reviewer. Neither is immediate work
+ * in the inbox, and a repeated identical wait is a no-op (no second notice).
+ */
+export async function waitTask(client: UpstashClient, code: string, id: string,
+  actor: { name: string; client: ClientKind }, input: WaitTaskInput, now = Date.now(), hostAuthorized = false,
+  proof?: TaskExecutionRequest,
+): Promise<{ board: TaskBoard; task: Task }> {
+  if (!['owner', 'review'].includes(input.scope) || !WAIT_REASONS.has(input.reasonCode)
+    || !input.reason?.trim() || !input.resumeWhen?.trim()) {
+    throw new TaskStateError('Wait requires scope, reasonCode, a specific reason and resumeWhen.');
+  }
+  const board = await casTaskBoard(client, code, async (current, room) => {
+    const task = findTask(current, id);
+    if (task.execution && !hostAuthorized) {
+      await executionActor(room, actor, proof);
+      if (input.scope === 'owner' && activeTaskLease(task.lease, now)) await assertTaskExecution(task, room, actor, proof, now);
+    }
+    const reviewing = input.scope === 'review';
+    if (reviewing ? task.state !== 'awaiting_review' : !['todo', 'in_progress', 'blocked'].includes(task.state)) {
+      throw new TaskStateError('Owner waits require open owner work; review waits require awaiting_review.');
+    }
+    if (!hostAuthorized && !sameActor(reviewing ? task.verifier : task.owner, reviewing ? task.verifierClient : task.ownerClient, actor)) {
+      throw new TaskStateError('Only the responsible owner/reviewer or the proven host can declare this wait.');
+    }
+    const waitingFor = input.waitingFor?.trim() || undefined;
+    if (waitingFor && room && !room.participants.some(p => p.name.trim().toLowerCase() === waitingFor.toLowerCase())) {
+      throw new TaskStateError(`waitingFor must name a room participant; ${waitingFor} is not in this room.`);
+    }
+    if (task.waiting && task.waiting.resumedAt === undefined && task.waiting.scope === input.scope
+      && task.waiting.reasonCode === input.reasonCode && task.waiting.reason === input.reason.trim()
+      && task.waiting.resumeWhen === input.resumeWhen.trim() && task.waiting.waitingFor === waitingFor) return current;
+    const waiting = { by: actor.name, byClient: actor.client, at: now,
+      scope: input.scope, reasonCode: input.reasonCode, reason: input.reason.trim(),
+      resumeWhen: input.resumeWhen.trim(), waitingFor };
+    return { ...replaceTask(current, { ...task, waiting, state: reviewing ? 'awaiting_review' : 'blocked',
+      ...(!reviewing ? { blocked: { by: actor.name, byClient: actor.client, at: now, reason: waiting.reason } } : {}), updatedAt: now }), lastProgressAt: now };
+  }, !!proof && !hostAuthorized);
+  return { board, task: findTask(board, id) };
+}
+
+/**
+ * Release a wait with a resolution note. The responsible agent, the named
+ * unblocker or the proven host may resume. Ordinary chat never does.
+ */
+export async function resumeTask(client: UpstashClient, code: string, id: string,
+  actor: { name: string; client: ClientKind }, resolution: string, now = Date.now(), hostAuthorized = false,
+  proof?: TaskExecutionRequest,
+): Promise<{ board: TaskBoard; task: Task }> {
+  if (!resolution?.trim()) throw new TaskStateError('Resume requires a resolution explaining how the missing condition was met.');
+  const board = await casTaskBoard(client, code, async (current, room) => {
+    const task = findTask(current, id);
+    if (task.execution && !hostAuthorized && actor.client === 'cc') await executionActor(room, actor, proof);
+    const wait = task.waiting;
+    if (task.state !== 'blocked' && !(task.state === 'awaiting_review' && wait && wait.resumedAt === undefined)) {
+      throw new TaskStateError('This task is not waiting.');
+    }
+    const reviewing = wait?.scope === 'review' && wait.resumedAt === undefined;
+    if (!hostAuthorized && !sameActor(reviewing ? task.verifier : task.owner, reviewing ? task.verifierClient : task.ownerClient, actor)
+      && !sameActor(wait?.waitingFor, undefined, actor)) {
+      throw new TaskStateError('Only the responsible agent, named unblocker or proven host can resume this task.');
+    }
+    return { ...replaceTask(current, { ...task, state: reviewing ? 'awaiting_review' : 'in_progress',
+      ...(reviewing ? { reviewRequestedAt: now } : {}),
+      ...(wait && wait.resumedAt === undefined ? { waiting: { ...wait, resumedAt: now, resumedBy: actor.name, resumedClient: actor.client, resolution: resolution.trim() } } : {}),
+      updatedAt: now }), lastProgressAt: now };
+  }, !!proof && !hostAuthorized && actor.client === 'cc');
+  return { board, task: findTask(board, id) };
 }
 
 // Owner/host declares a task cannot proceed — missing deploy/access rights,
@@ -764,7 +1155,7 @@ export async function blockTask(
     };
     return { ...replaceTask(current, updated), lastProgressAt: now };
   });
-  return { board, task: updated! };
+  return { board, task: findTask(board, updated!.id) };
 }
 
 export class TaskDoneImmutableError extends UpstashError {
@@ -808,7 +1199,7 @@ export async function hostSetTaskState(
     };
     return { ...replaceTask(current, updated), lastProgressAt: now };
   });
-  return { board, task: updated! ?? findTask(board, id) };
+  return { board, task: findTask(board, id) };
 }
 
 function nextSubtaskId(task: Task): string {
@@ -839,7 +1230,7 @@ export async function addSubtask(
     updated = { ...task, subtasks: [...(task.subtasks ?? []), created], updatedAt: now };
     return { ...replaceTask(current, updated), lastProgressAt: now };
   });
-  return { board, task: updated!, subtask: created! };
+  return { board, task: findTask(board, taskId), subtask: created! };
 }
 
 // Tick / untick a subtask. Self-ticking is fine — the parent task still needs
@@ -869,7 +1260,7 @@ export async function toggleSubtask(
     };
     return { ...replaceTask(current, updated), lastProgressAt: now };
   });
-  return { board, task: updated! };
+  return { board, task: findTask(board, updated!.id) };
 }
 
 // Stamp lastReviewAt after a periodic board review pass. Best-effort bookkeeping

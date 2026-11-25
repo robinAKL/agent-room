@@ -1,5 +1,5 @@
-import type { Message, MessageMetadata, RoleInTurn, InvocationType } from '@agent-room/shared';
-import { MAX_MESSAGES_PER_ROOM, ROOM_TTL_SECONDS } from '@agent-room/shared';
+import type { Message, MessageMetadata, RoleInTurn, InvocationType, Room, TaskBoard } from '@agent-room/shared';
+import { MAX_MESSAGES_PER_ROOM, ROOM_TTL_SECONDS, recordTaskNotificationPublished, sessionStartedAt } from '@agent-room/shared';
 import type { UpstashClient } from './client.js';
 import { findSpeaker, MutedError, NotYourTurnError, getRoom } from './rooms.js';
 import type { TurnSpokenEntry } from './turnState.js';
@@ -345,6 +345,105 @@ export async function appendSystemMessage(
 ): Promise<void> {
   const room = await getRoom(client, code); // throws RoomNotFoundError if the room is gone
   await rpushMessage(client, code, message, room.createdAt);
+}
+
+// Claim, append and acknowledge one task notification in the SAME script.
+// A process dying between append and acknowledgement cannot duplicate it on
+// the next read; an old assignment cannot notify a reviewer after a concurrent
+// reassignment, and a notice from before a room reopen is never published.
+// Returns 1 published, 0 stale/not applicable, 2 board version moved (retry).
+export const TASK_NOTIFICATION_SCRIPT = `-- task-notification
+local raw = redis.call('GET', KEYS[4])
+if not raw then return 0 end
+local board = cjson.decode(raw)
+local task = nil
+for _, candidate in ipairs(board.tasks) do
+  if candidate.id == ARGV[4] then task = candidate break end
+end
+if not task or not task.notification or task.notification == cjson.null then return 0 end
+local notice = task.notification
+if notice.id ~= ARGV[5] or (notice.deliveredAt and notice.deliveredAt ~= cjson.null) then return 0 end
+local waiting = task.waiting and task.waiting ~= cjson.null and (not task.waiting.resumedAt or task.waiting.resumedAt == cjson.null)
+if notice.kind == 'review_requested' and (task.state ~= 'awaiting_review' or task.reviewStatus == 'waiting_for_capability' or task.verifier ~= notice.target or waiting) then return 0 end
+if notice.kind == 'work_requested' and (task.owner ~= notice.target or (task.state ~= 'in_progress' and task.state ~= 'rejected') or waiting or (task.execution and task.execution ~= cjson.null and task.execution.decisionRequired == true)) then return 0 end
+if notice.kind == 'waiting' and not waiting then return 0 end
+if tostring(board.version) ~= ARGV[6] then return 2 end
+local roomRaw = redis.call('GET', KEYS[1])
+if not roomRaw then return 0 end
+local room = cjson.decode(roomRaw)
+if room.status ~= 'active' or tostring(room.reactivatedAt or room.createdAt) ~= ARGV[1] then return 0 end
+redis.call('RPUSH', KEYS[2], ARGV[2])
+redis.call('INCR', KEYS[3])
+redis.call('LTRIM', KEYS[2], ARGV[3], -1)
+redis.call('EXPIREAT', KEYS[2], tonumber(ARGV[8]))
+redis.call('EXPIREAT', KEYS[3], tonumber(ARGV[8]))
+-- Preserve empty JSON arrays: Lua cjson re-encoding would turn [] into {}.
+-- The proposed board is serialized by JS and guarded by the board version.
+redis.call('SET', KEYS[4], ARGV[7], 'KEEPTTL')
+return 1`;
+
+/** The transcript line a task notification is published as. */
+export function taskNotificationText(task: TaskBoard['tasks'][number]): string {
+  const notice = task.notification!;
+  const action = notice.kind === 'review_requested'
+    ? 'Independently inspect the submitted evidence, then room_task verify. If access is missing, use room_task wait with scope review.'
+    : notice.kind === 'work_requested'
+      ? task.execution?.recoveryRequired
+        ? 'Execution needs recovery. Read attempt history/evidence and room_task recover with a resolution; lease expiry is not task failure.'
+        : 'Resume the task and submit evidence when its done-when criteria pass.'
+      : `Waiting: ${task.waiting?.reason ?? ''}. Resume when: ${task.waiting?.resumeWhen ?? ''}. Use room_task resume with a resolution after the condition is met.`;
+  return `📋 @${notice.target}: ${task.id} "${task.title}" — ${action}`;
+}
+
+/**
+ * Publish every pending responsibility notification on the board as a
+ * targeted system message, exactly once each. Board state is the durable
+ * source of responsibility: if publishing fails, the intent stays on the task
+ * and the next board read or join retries it. `onPublished` (webhooks) is
+ * best-effort and never undoes a publication.
+ */
+export async function publishTaskNotifications(client: UpstashClient, code: string,
+  onPublished?: (message: Message, room: Room) => Promise<void>,
+  snapshot?: TaskBoard,
+): Promise<number> {
+  const raw = snapshot ? null : await client.command<string | null>(['GET', `task-board:${code}`]);
+  if (!snapshot && !raw) return 0;
+  let board = snapshot ?? JSON.parse(raw!) as TaskBoard;
+  const pending = board.tasks.filter(t => t.notification && t.notification.deliveredAt === undefined);
+  if (!pending.length) return 0;
+  const room = await getRoom(client, code);
+  const expireAt = (Number.isFinite(room.createdAt) ? Math.floor(room.createdAt / 1000) : Math.floor(Date.now() / 1000)) + ROOM_TTL_SECONDS;
+  let delivered = 0;
+  for (const [index, task] of pending.entries()) {
+    const notice = task.notification!;
+    const message: Message = { id: notice.at + index, type: 'sys', name: 'system', client: 'cc',
+      initials: '📋', color: '#6366F1', role: '', time: notice.at, text: taskNotificationText(task),
+      metadata: { eventType: 'task_update', taskId: task.id, taskEventId: notice.id,
+        taskVersion: board.version, targetAgentName: notice.target, ...(notice.targetClient ? { targetAgentClient: notice.targetClient } : {}) } };
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const current = board.tasks.find(t => t.id === task.id)?.notification;
+      if (!current || current.id !== notice.id || current.deliveredAt !== undefined) break;
+      const publishedAt = Date.now();
+      const next: TaskBoard = { ...board, version: board.version + 1, tasks: board.tasks.map(t => t.id === task.id
+        ? recordTaskNotificationPublished({ ...t, notification: { ...current, deliveredAt: publishedAt } }, board.version + 1, publishedAt) : t) };
+      const accepted = Number(await client.command<number>(['EVAL', TASK_NOTIFICATION_SCRIPT, 4,
+        `room:${code}`, msgsKey(code), msgCountKey(code), `task-board:${code}`,
+        String(sessionStartedAt(room)), JSON.stringify(message), -MAX_MESSAGES_PER_ROOM, task.id, notice.id,
+        String(board.version), JSON.stringify(next), expireAt]));
+      if (accepted === 2) {
+        const latest = await client.command<string | null>(['GET', `task-board:${code}`]);
+        if (!latest) break;
+        board = JSON.parse(latest) as TaskBoard;
+        continue;
+      }
+      if (accepted === 1) {
+        board = next; delivered++;
+        try { await onPublished?.(message, room); } catch { /* external transport is best-effort; the inbox remains durable */ }
+      }
+      break;
+    }
+  }
+  return delivered;
 }
 
 // Cursor semantics: `fromIndex` is the absolute count of messages the caller

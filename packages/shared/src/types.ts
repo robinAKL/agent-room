@@ -27,6 +27,53 @@ export interface Participant {
   // Present only after a signed fleet Agent Card has been verified. This is
   // part of the room document so every RoomPersistence adapter retains it.
   authenticatedIdentity?: AuthenticatedMemberIdentity;
+  // Hash of the private seatKey returned to this agent seat on room_join. The
+  // key itself is only ever held by the caller. A fresh join without the
+  // matching key rotates it, which fences any process that still holds the
+  // old one (see taskExecution.ts).
+  seatKeyHash?: string;
+  /** Stable public seat identity; possession is still proven by seatKey. */
+  seatId?: string;
+  /** Agent-declared working context, bound to seatId and cleared on rejoin. */
+  capabilities?: AgentCapabilityReport;
+}
+
+export type AgentCapability = 'commands' | 'room_files' | 'native_continuation';
+export interface AgentCapabilityReport {
+  source: 'agent_report';
+  reportedAt: number;
+  memberId: string;
+  workspaceId?: string;
+  repository?: string;
+  revision?: string;
+  tools: Partial<Record<AgentCapability, 'yes' | 'no' | 'unknown'>>;
+}
+export interface TaskCapabilityRequirements {
+  workspaceId?: string;
+  repository?: string;
+  /** Exact starting revision, not a promise that work will leave HEAD unchanged. */
+  revision?: string;
+  tools?: AgentCapability[];
+}
+export interface TaskRequirements {
+  owner?: TaskCapabilityRequirements;
+  review?: TaskCapabilityRequirements;
+}
+
+export interface TaskAttempt {
+  id: string;
+  leaseId: string;
+  memberId: string;
+  name: string;
+  client: ClientKind;
+  status: 'running' | 'submitted' | 'interrupted' | 'waiting' | 'released' | 'cancelled';
+  startedAt: number;
+  confirmedAt: number;
+  roomSessionStartedAt?: number;
+  endedAt?: number;
+  endReason?: string;
+  recoveryNote?: string;
+  context?: Pick<AgentCapabilityReport, 'workspaceId' | 'repository' | 'revision'>;
 }
 
 // How agent responses are coordinated in this room.
@@ -178,6 +225,9 @@ export interface Room {
   appId?: string;
   status: 'active' | 'ended';
   endedAt?: number;      // epoch ms — set when meeting ends
+  // epoch ms of the last reactivateRoom. A reopened room is a new session:
+  // task executions started in the previous session are fenced off.
+  reactivatedAt?: number;
   version: number;       // for optimistic concurrency
   participants: Participant[];
   // Omitted for legacy rooms. Authenticated joins must select one of these.
@@ -237,6 +287,12 @@ export interface MessageMetadata {
   // targetAgentName='Claude'. For timed_out events, the agent that timed out.
   targetAgentName?: string;
   targetAgentClient?: ClientKind;
+  // task_update notifications: the task, the durable notification id and the
+  // board version it was published from. Lets webhooks and clients correlate a
+  // transcript line with the board responsibility it announces.
+  taskId?: string;
+  taskEventId?: string;
+  taskVersion?: number;
   // For skipped_by_host / timed_out events: who/what triggered the skip.
   skippedBy?: 'system' | 'host';
   // Sequential mode: set on a room_status heartbeat sent by the current
@@ -398,6 +454,54 @@ export interface TaskBlock {
   reason: string;        // what exactly is missing — required
 }
 
+export type TaskWaitReason = 'missing_user_input' | 'missing_credential' | 'tool_failure' | 'dependency' | 'other';
+
+/** An explicit owner or review wait. Kept after resume as history. */
+export interface TaskWait extends TaskBlock {
+  scope: 'owner' | 'review';
+  reasonCode: TaskWaitReason;
+  waitingFor?: string;
+  resumeWhen: string;
+  resumedAt?: number;
+  resolution?: string;
+  resumedBy?: string;
+  resumedClient?: ClientKind;
+}
+
+/** One outstanding responsibility notification; a newer assignment supersedes it. */
+export interface TaskNotification {
+  id: string;
+  kind: 'review_requested' | 'work_requested' | 'waiting';
+  target: string;
+  targetClient?: ClientKind;
+  at: number;
+  deliveredAt?: number;
+}
+
+export type TaskTimelineKind = 'history_started' | 'task_created' | 'owner_assigned' | 'reviewer_assigned'
+  | 'state_changed' | 'scope_changed' | 'execution_started' | 'execution_renewed' | 'execution_ended'
+  | 'waiting' | 'resumed' | 'review_readiness' | 'notification_created' | 'notification_published' | 'notification_superseded'
+  | 'review_acknowledged' | 'review_started' | 'review_verdict';
+
+/** Observed task facts, not a transcript of an external IDE's internal work. */
+export interface TaskTimelineEvent {
+  id: string;
+  kind: TaskTimelineKind;
+  at: number;
+  recordedAt: number;
+  boardVersion: number;
+  source: 'server' | 'participant_report';
+  actor?: string;
+  target?: string;
+  from?: string;
+  to?: string;
+  scope?: 'owner' | 'review';
+  reason?: string;
+  detail?: string;
+  attemptId?: string;
+  notificationId?: string;
+}
+
 // A lightweight checklist item under a Task. Subtasks are intentionally NOT
 // evidence-gated — they're the producer's own breakdown of the work, ticked
 // off as they go. The parent Task still requires peer verification (verifyTask)
@@ -469,6 +573,22 @@ export interface Task {
   verdict?: TaskVerdict;   // latest verifier ruling
   cancellation?: TaskCancellation; // set when archived to 'cancelled'
   blocked?: TaskBlock;     // latest block declaration (kept after reopen as history)
+  waiting?: TaskWait;      // latest explicit wait (kept after resume as history)
+  // Review assignment state, maintained by applyTaskPolicy inside the board CAS.
+  reviewStatus?: 'assigned' | 'waiting_for_verifier' | 'verifier_offline' | 'waiting_for_capability';
+  reviewReadiness?: string;
+  reviewRequestedAt?: number;
+  /** Explicit agent acknowledgement, distinct from server-side notification publication. */
+  reviewReceipt?: { by: string; byClient: ClientKind; notificationId?: string; readAt: number; startedAt?: number };
+  notification?: TaskNotification;
+  requirements?: TaskRequirements;
+  // Fenced MCP execution: every claim/recovery mints a new attempt + lease.
+  attempts?: TaskAttempt[];
+  execution?: { attemptId: string; recoveryRequired: boolean; decisionRequired?: boolean };
+  submittedAttemptId?: string;
+  /** Bounded, append-only retained history; older events may be trimmed. */
+  timeline?: TaskTimelineEvent[];
+  timelineDropped?: number;
   // Audit trail of owner/verifier reassignments (host / moderator escape
   // hatch). Optional + append-only, so boards created before this field
   // existed keep working unchanged.
@@ -545,6 +665,10 @@ export const TASK_BOARD_REVIEW_INTERVAL_MS = 180_000;
 // tally and enforces the demotion (the LLM can't reliably count across turns).
 export const TASK_BLOCK_STALL_MS = 180_000;        // ~3 × the 1-min review cadence
 export const TASK_BLOCK_DEMOTE_THRESHOLD = 2;      // blocked tasks before demotion
+
+// How long an assigned reviewer may stay offline (and unstarted) before the
+// board hands the review to another available agent.
+export const TASK_REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
 
 export interface ReportParticipant {
   name: string;

@@ -48,6 +48,18 @@ import {
   verifyTask,
   reassignTaskRoles,
   cancelTask,
+  updateTask,
+  waitTask,
+  resumeTask,
+  acknowledgeTaskReview,
+  operateTaskExecution,
+  reconcileTaskReviews,
+  publishTaskNotifications,
+  reportAgentCapabilities,
+  sanitizeCapabilityReport,
+  TaskExecutionError,
+  SeatProofError,
+  sha256Hex,
   registerRoomWebhook,
   listRoomWebhooks,
   unregisterRoomWebhook,
@@ -109,6 +121,55 @@ export function createRemoteRoomClient(_requestHost: string | undefined): Remote
 const str = (v: unknown): string => (typeof v === 'string' ? v : '');
 const agent = (name: unknown) => ({ name: str(name), client: 'cc' as const });
 
+/** Seat proof and fencing token an MCP task call carries. */
+function executionProof(p: Record<string, unknown>) {
+  return {
+    ...(typeof p.seatKey === 'string' && p.seatKey ? { seatKey: p.seatKey } : {}),
+    ...(typeof p.attemptId === 'string' && p.attemptId ? { attemptId: p.attemptId } : {}),
+    ...(typeof p.ttlMs === 'number' ? { ttlMs: p.ttlMs } : {}),
+  };
+}
+
+/** True only when the presented hostKey matches the room's stored hash. */
+async function isProvenHost(store: UpstashClient, code: string, hostKey: unknown): Promise<boolean> {
+  if (typeof hostKey !== 'string' || !hostKey) return false;
+  try {
+    const room = await storeGetRoom(store, code);
+    return !!room.hostKeyHash && room.hostKeyHash === await sha256Hex(hostKey);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Publish any pending task responsibility notifications as targeted system
+ * messages, then fan each one out to the target's webhooks. There is no
+ * server between the web app and storage in this deployment, so this runs
+ * after every MCP task write and board read instead of from a room API.
+ * Never fatal: an unpublished intent stays on the board and is retried.
+ */
+export async function publishBoardNotifications(store: UpstashClient, code: string): Promise<void> {
+  try {
+    await publishTaskNotifications(store, code, async (message, room) => {
+      const cursor = await storeListMessages(store, code, 0).then(m => m.length).catch(() => null);
+      await dispatchRoomWebhooks(store, room, message, cursor);
+    });
+  } catch { /* the board keeps the intent */ }
+}
+
+/** Board read that also repairs review assignment and publishes due notices. */
+async function readBoard(store: UpstashClient, code: string) {
+  try { await reconcileTaskReviews(store, code); } catch { /* read-only fallback below */ }
+  await publishBoardNotifications(store, code);
+  return getTaskBoard(store, code);
+}
+
+/** Every task write is followed by notification publication. */
+async function afterTaskWrite<T>(store: UpstashClient, code: string, result: T): Promise<T> {
+  await publishBoardNotifications(store, code);
+  return result;
+}
+
 /** The `{ action }` envelope, mapped onto upstash-client. */
 async function dispatchAction(store: UpstashClient, p: Record<string, unknown>): Promise<unknown> {
   const code = str(p.code);
@@ -116,39 +177,98 @@ async function dispatchAction(store: UpstashClient, p: Record<string, unknown>):
     switch (p.action) {
       // ── task board ──────────────────────────────────────────────────────
       case 'taskBoard':
-        return { board: (await getTaskBoard(store, code)) ?? { code, tasks: [], version: 0 } };
+        return { board: (await readBoard(store, code)) ?? { code, tasks: [], version: 0 } };
       case 'taskCreate':
-        return await createTask(store, code, {
+        return afterTaskWrite(store, code, await createTask(store, code, {
           title: str(p.title),
           createdBy: str(p.requesterName),
           ...(p.id ? { id: str(p.id) } : {}),
           ...(p.owner ? { owner: str(p.owner), ownerClient: 'cc' as const } : {}),
           ...(p.verifier ? { verifier: str(p.verifier), verifierClient: 'cc' as const } : {}),
           ...(p.dod ? { dod: str(p.dod) } : {}),
-        });
+          ...(p.requirements !== undefined ? { requirements: p.requirements as Parameters<typeof createTask>[2]['requirements'] } : {}),
+        }));
       case 'taskClaim':
-        return await claimTask(store, code, str(p.id), agent(p.name));
-      case 'taskSubmit':
-        return await submitTask(
+        // Every MCP claim starts a fenced execution; the seatKey proves the seat.
+        return afterTaskWrite(store, code, await claimTask(store, code, str(p.id), agent(p.name), Date.now(), executionProof(p)));
+      case 'taskSubmit': {
+        const proof = executionProof(p);
+        return afterTaskWrite(store, code, await submitTask(
           store, code, str(p.id), agent(p.name),
           p.evidence as Parameters<typeof submitTask>[4],
-        );
-      case 'taskVerify':
-        return await verifyTask(
+          Date.now(),
+          proof.seatKey || proof.attemptId ? proof : undefined,
+        ));
+      }
+      case 'taskVerify': {
+        const proof = executionProof(p);
+        return afterTaskWrite(store, code, await verifyTask(
           store, code, str(p.id), agent(p.name),
           p.verdict === 'done' ? 'done' : 'rejected',
           typeof p.note === 'string' ? p.note : undefined,
-        );
+          Date.now(),
+          proof.seatKey ? { reviewerProof: proof } : {},
+        ));
+      }
       case 'taskReassign':
-        return await reassignTaskRoles(store, code, str(p.id), {
-          ...(p.owner ? { owner: str(p.owner), ownerClient: 'cc' as const } : {}),
-          ...(p.verifier ? { verifier: str(p.verifier), verifierClient: 'cc' as const } : {}),
-        }, agent(p.requesterName));
+        return afterTaskWrite(store, code, await reassignTaskRoles(store, code, str(p.id), {
+          ...(p.owner ? { owner: str(p.owner), ...(p.ownerClient ? { ownerClient: p.ownerClient as 'cc' | 'web' } : {}) } : {}),
+          ...(p.verifier ? { verifier: str(p.verifier), ...(p.verifierClient ? { verifierClient: p.verifierClient as 'cc' | 'web' } : {}) } : {}),
+        }, agent(p.requesterName)));
       case 'taskCancel':
-        return await cancelTask(
+        return afterTaskWrite(store, code, await cancelTask(
           store, code, str(p.id), agent(p.requesterName),
           typeof p.reason === 'string' ? p.reason : undefined,
-        );
+        ));
+      case 'taskUpdate':
+        return afterTaskWrite(store, code, await updateTask(store, code, str(p.id), {
+          ...(typeof p.title === 'string' ? { title: p.title } : {}),
+          ...(typeof p.dod === 'string' ? { dod: p.dod } : {}),
+          ...(p.requirements !== undefined ? { requirements: p.requirements as Parameters<typeof updateTask>[3]['requirements'] } : {}),
+          actor: agent(p.requesterName),
+        }));
+      case 'taskWait': {
+        const host = await isProvenHost(store, code, p.hostKey);
+        const proof = executionProof(p);
+        return afterTaskWrite(store, code, await waitTask(store, code, str(p.id), agent(p.name), {
+          scope: p.scope === 'review' ? 'review' : 'owner',
+          reasonCode: str(p.reasonCode) as Parameters<typeof waitTask>[4]['reasonCode'],
+          reason: str(p.reason),
+          resumeWhen: str(p.resumeWhen),
+          ...(typeof p.waitingFor === 'string' && p.waitingFor ? { waitingFor: p.waitingFor } : {}),
+        }, Date.now(), host, proof.seatKey ? proof : undefined));
+      }
+      case 'taskResume': {
+        const host = await isProvenHost(store, code, p.hostKey);
+        const proof = executionProof(p);
+        return afterTaskWrite(store, code, await resumeTask(store, code, str(p.id), agent(p.name), str(p.resolution),
+          Date.now(), host, proof.seatKey ? proof : undefined));
+      }
+      case 'taskReviewAck': {
+        const proof = executionProof(p);
+        return afterTaskWrite(store, code, await acknowledgeTaskReview(store, code, str(p.id), agent(p.name), p.started === true,
+          typeof p.notificationId === 'string' && p.notificationId ? p.notificationId : undefined, Date.now(),
+          proof.seatKey ? proof : undefined));
+      }
+      case 'taskExecution': {
+        const operation = str(p.operation) as 'renew' | 'recover' | 'release' | 'handoff';
+        if (!['renew', 'recover', 'release', 'handoff'].includes(operation)) {
+          throw new RemoteRoomApiError(`Unknown execution operation "${operation}".`, 400, 'bad_request');
+        }
+        return afterTaskWrite(store, code, await operateTaskExecution(store, code, str(p.id), agent(p.name), operation,
+          executionProof(p), {
+            ...(typeof p.resolution === 'string' ? { resolution: p.resolution } : {}),
+            ...(typeof p.to === 'string' ? { to: p.to } : {}),
+          }));
+      }
+      case 'agentCapabilities': {
+        const room = await reportAgentCapabilities(store, code, str(p.name), p.capabilities,
+          typeof p.seatKey === 'string' ? p.seatKey : undefined, sanitizeCapabilityReport);
+        // A new report can make a waiting review assignable.
+        const board = await readBoard(store, code).catch(() => null);
+        const me = room.participants.find(item => item.name === str(p.name) && item.client === 'cc');
+        return { capabilities: me?.capabilities, ...(board ? { board } : {}) };
+      }
 
       // ── resident webhooks ───────────────────────────────────────────────
       case 'webhookSet': {
@@ -217,6 +337,8 @@ async function dispatchAction(store: UpstashClient, p: Record<string, unknown>):
         );
     }
   } catch (e) {
+    if (e instanceof TaskExecutionError) throw new RemoteRoomApiError(e.message, 409, `task_execution_${e.code}`);
+    if (e instanceof SeatProofError) throw new RemoteRoomApiError(e.message, 403, 'task_execution_identity_required');
     if (e instanceof WebhookLimitError) throw new RemoteRoomApiError(e.message, 409, 'WebhookLimitError');
     if (e instanceof NotParticipantError) throw new RemoteRoomApiError(e.message, 403, 'NotParticipantError');
     return translate(e);
@@ -330,6 +452,10 @@ export async function joinRoom(
       ...(options.seatKey ? { seatKey: options.seatKey } : {}),
       priorIdentity: { name: participant.name, client: 'cc' as const },
     });
+    // A joining agent may be the reviewer a solo submission was waiting for,
+    // and a rejoin may have rotated a seat that held an execution lease.
+    try { await reconcileTaskReviews(client.store, code); } catch { /* best effort */ }
+    await publishBoardNotifications(client.store, code);
     return result as Room & { participant: Participant; seatKey?: string };
   });
 }

@@ -33,7 +33,7 @@ import {
   AGENT_ROOM_ASYNC_LISTEN,
   AGENT_ROOM_CODEX_CONTINUE,
 } from '@agent-room/shared';
-import type { ClientKind, Message, Participant, Room, TaskBoard, Task } from '@agent-room/shared';
+import type { ClientKind, Message, Participant, Room, TaskBoard, Task, TaskInbox } from '@agent-room/shared';
 import { buildRoomRetro, isConfiguredModerator } from '@agent-room/upstash-client';
 import type { TaskBoard as RetroBoard } from '@agent-room/shared';
 import {
@@ -90,6 +90,7 @@ const NEXT_LISTEN = (code: string, cursor: number): string =>
   // Required means do not end the turn without it, not do it instead of the work.
   'WORK FIRST: record requested work with room_task create; follow roomPolicy planning and role boundaries before claiming or implementing it. Once agreed, do it and report it with room_send / room_task before the next room_listen. ' +
   'Keep listening even when the room is quiet, nobody else is present, or every task is done. ' +
+  'If progress requires a person to log in, approve something, or provide evidence, record the task blocker with room_task wait (scope owner or review, reasonCode, reason, resumeWhen), then resume room_listen so you can receive their response without a separate continue prompt. ' +
   // The failure this names is the one that actually happens. Traced across a
   // real 2-day session: every drop that needed a human to restart it ended
   // with the agent writing a paragraph to its user and no tool call after it
@@ -156,7 +157,7 @@ const nextListenAction = (
  * after a submit, not presented as the immediate action while work is active.
  */
 const nextActionForInbox = (
-  inbox: { toVerify: string[]; current: string[]; queued: string[] },
+  inbox: Pick<TaskInbox, 'toVerify' | 'current' | 'queued' | 'waiting' | 'reviewEvents' | 'toRecover' | 'executions'>,
   code: string,
   cursor: number,
   name?: string,
@@ -169,25 +170,38 @@ const nextActionForInbox = (
       kind: 'task_review' as const,
       action: 'verify_task' as const,
       taskId: review,
+      startReview: { tool: 'room_task', arguments: { code, name, id: review, action: 'review_start', notificationId: inbox.reviewEvents?.[review] } },
       instruction:
-        `Independently check ${review} now, then call room_task verify with verdict and note. `
-        + 'If you cannot access the artifact, report [BLOCKED] with the missing access rather than rejecting its quality without inspecting it. Do not acknowledge it with a status-only message.',
+        `Call room_task review_start for ${review} to acknowledge the current assignment, independently check it, then call room_task verify with verdict and note. `
+        + 'If you cannot access the artifact, call room_task wait with scope review and the missing access rather than rejecting its quality without inspecting it. Do not acknowledge it with a status-only message.',
       afterVerdict: nextListenAction(code, cursor, name, prefs),
     };
   }
   const current = inbox.current[0];
   if (current) {
+    const execution = inbox.executions?.[current];
     return {
       required: true,
       kind: 'task_work' as const,
       action: 'execute_task' as const,
       taskId: current,
+      ...(execution ? { execution,
+        confirmExecution: { tool: 'room_task', arguments: { code, name, id: current, action: 'recover' } },
+        renewExecution: { tool: 'room_task', arguments: { code, name, id: current, action: 'renew', attemptId: execution.attemptId } } } : {}),
       instruction:
-        `Use your coding/filesystem tools to make concrete progress on ${current} now. `
+        (execution ? 'Confirm this seat with room_task recover (seatKey) before continuing. Carry the returned attemptId on submit/renew; renew explicitly before the task lease expires. ' : '')
+        + `Use your coding/filesystem tools to make concrete progress on ${current} now. `
         + 'Do not call room_send with a status update and do not call room_listen first. '
+        + 'If input or access is missing, call room_task wait with the specific reason and resumeWhen, then keep listening. '
         + 'When the done-when criteria pass, call room_task submit with real evidence.',
       afterSubmit: nextListenAction(code, cursor, name, prefs),
     };
+  }
+  const recovery = inbox.toRecover?.[0];
+  if (recovery) {
+    return { required: true, kind: 'task_recovery' as const, tool: 'room_task' as const,
+      action: 'recover', taskId: recovery,
+      instruction: 'Read current task evidence and attempt history (room_task history), then room_task recover with your seatKey and a resolution describing what you will resume. Do not submit an old attempt or treat expiry as task failure.' };
   }
   const queued = inbox.queued[0];
   if (queued) {
@@ -201,11 +215,16 @@ const nextActionForInbox = (
       instruction: `Follow roomPolicy planning and role boundaries before claiming ${queued}; once agreed, execute it before returning to room_listen.`,
     };
   }
-  return nextListenAction(code, cursor, name, prefs);
+  const listen = nextListenAction(code, cursor, name, prefs);
+  return inbox.waiting?.length ? { ...listen, kind: 'task_wait' as const, waiting: inbox.waiting,
+    instruction: inbox.waiting.some(t => t.kind === 'decision') ? 'Wait for an explicit decision on repeated rejections. Do not automatically recover or retry; the task must be reopened or cancelled.'
+      : inbox.waiting.some(t => t.kind === 'capability')
+        ? 'Report your actual current context with room_task capabilities, or request a capable reviewer. Unknown access must not be reported as yes. Keep listening if the capability is unavailable.'
+        : 'Keep listening for the missing input. Resume only after the recorded condition is met; no repeated execution or status messages are required.' } : listen;
 };
 
-const inboxRequiresWork = (inbox: { toVerify: string[]; current: string[]; queued: string[] }): boolean =>
-  inbox.toVerify.length > 0 || inbox.current.length > 0 || inbox.queued.length > 0;
+const inboxRequiresWork = (inbox: { toVerify: string[]; current: string[]; queued: string[]; toRecover?: string[] }): boolean =>
+  inbox.toVerify.length > 0 || inbox.current.length > 0 || inbox.queued.length > 0 || (inbox.toRecover?.length ?? 0) > 0;
 
 /** Agents (not the web watchers) currently seated in the room. */
 function agentCount(room: Room): number {
@@ -313,7 +332,12 @@ const LISTEN_IMAGE_MIME = /^(image\/(png|jpeg|jpg|webp|gif))$/i;
 function ok(value: unknown, extra: McpContent[] = []): McpToolResult {
   return {
     content: [
-      { type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) },
+      { type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value,
+        function (this: Record<string, unknown>, key: string, field: unknown) {
+          // Full task histories belong in the UI or an explicit paginated read
+          // (room_task history), not in every listen/join/mutation response.
+          return key === 'timeline' && typeof this.id === 'string' && typeof this.state === 'string' ? undefined : field;
+        }, 2) },
       ...extra,
     ],
   };
@@ -420,8 +444,8 @@ async function boardInbox(
   code: string,
   name: string,
   addressed = false,
-): Promise<{ toVerify: string[]; toDo: string[]; current: string[]; queued: string[]; hint: string }> {
-  const none = { toVerify: [], toDo: [], current: [], queued: [], hint: '' };
+): Promise<TaskInbox> {
+  const none: TaskInbox = { toVerify: [], toDo: [], current: [], queued: [], hint: '' };
   if (profile !== 'full' || !name.trim()) return none;
   try {
     const board = await client
@@ -807,14 +831,37 @@ async function roleClients(
   };
 }
 
+const TASK_REQUIREMENT = { type: 'object', additionalProperties: false, properties: {
+  workspaceId: { type: 'string' }, repository: { type: 'string' }, revision: { type: 'string' },
+  tools: { type: 'array', items: { type: 'string', enum: ['commands', 'room_files', 'native_continuation'] } },
+} };
+
+/**
+ * What to do about task_execution_identity_required, said so the next call
+ * can succeed. This deployment has no server-derived seat origin, so the
+ * seatKey from room_join is the only seat proof there is: rejoining without
+ * then sending it changes nothing.
+ */
+function identityRequiredHint(sentSeatKey: boolean): string {
+  return sentSeatKey
+    ? 'The seatKey on this call does not match the seat. Call room_join again with your saved seatKey to get the current one, then retry this room_task call with the seatKey that join returns. Never post keys to room chat.'
+    : 'This call carried no seatKey, and the seatKey is the only seat proof this server accepts. Retry this SAME room_task call with seatKey set to the value room_join returned — rejoining first does not help. If your room_task tool has no seatKey parameter, your tool list predates it: reconnect the Agent Room server (or start a new session), then room_join with your saved seatKey. Never post keys to room chat.';
+}
+
+/** Join-time notice: say up front that task calls need the seatKey. */
+const SEAT_KEY_REQUIRED_NOTICE = {
+  required: 'seatKey',
+  hint: 'Send the seatKey above on EVERY room_task call that changes a task (claim, submit, verify, renew, recover, …) and on any later room_join. Without it those calls are refused with task_execution_identity_required.',
+} as const;
+
 export const FULL_TOOLS: ToolDef[] = [
   {
     name: 'room_task',
     description:
       [
-        'Evidence-gated task board, one tool for all actions. list → read the board. create → add a task; YOU may create one for yourself the moment the room asks for work, without waiting to be assigned (owner + definition-of-done, and a verifier who is not the owner IF another agent is here — leave verifier unset when you are the only one, never skip the task over it). claim → take a task (state: in_progress). submit → hand in with PROOF: what you produced (fileListing + fileExcerpt) and how you checked it — runOutput + exitCode if it has a run, otherwise checks, each done-when criterion and how you verified it. Goes to awaiting_review, never straight to done. verify → the designated verifier rules done/rejected (never your own task). reassign → any joined participant moves owner/verifier. cancel → any joined participant archives todo/in_progress tasks to the cancelled lane.',
+        'Evidence-gated task board, one tool for all actions. list → read the board. history → a task\'s retained event timeline, newest first, paginated. create → add a task; YOU may create one for yourself the moment the room asks for work, without waiting to be assigned (owner + definition-of-done; verifier optional — on submission the server assigns an available independent agent, or records that the task is waiting for one). claim → take a task: starts a fenced execution, returns attemptId + lease; send your seatKey. submit → hand in with PROOF: what you produced (fileListing + fileExcerpt) and how you checked it — runOutput + exitCode if it has a run, otherwise checks, each done-when criterion and how you verified it; send seatKey + attemptId. Goes to awaiting_review, never straight to done. verify → the designated verifier rules done/rejected (never your own task). renew → extend your execution lease before it expires; recover → after expiry/interruption, start a new attempt with a resolution; release/handoff → give the execution up or to another agent. reassign → any joined participant moves owner/verifier. update → change title/dod/requirements. cancel → any joined participant archives todo/in_progress tasks to the cancelled lane. wait/block → declare missing input; resume → release a wait with a resolution. ack/review_start → acknowledge or accept your current review. capabilities → report your actual working context (agent-declared).',
         'Record requested work yourself with create, then follow roomPolicy planning and role boundaries before claiming and executing it — do not ask the room to "assign it formally" first. If the request is one you cannot do, answer that in the room; silence is never the reply to a direct request.',
-        'The board is the source of truth. Real work gets a task; a task is done only when its VERIFIER rules done, never because the owner says so — so verify by re-doing the check yourself: re-run the command, or open the artifact and walk the done-when criteria. Reading the output the owner pasted is not verifying. If you cannot access the artifact, report [BLOCKED] with the actual missing access; do not reject its quality without inspecting it. Reassign the verifier to a capable seated agent when appropriate. Before reporting a follow-up complete, create a revision task unless an existing open task already covers its acceptance criteria; name the task id. [TODO] text alone does not update the board.',
+        'When work needs a known repository, workspace or tools, declare requirements.owner/review and report actual capabilities with room_task capabilities; unknown access stays unknown. The board is the source of truth. Real work gets a task; a task is done only when its VERIFIER rules done, never because the owner says so — so verify by re-doing the check yourself: re-run the command, or open the artifact and walk the done-when criteria. Reading the output the owner pasted is not verifying. If input or artifact access is missing, call room_task wait with scope owner or review, reasonCode, reason and resumeWhen; keep room_listen while waiting. Resume with room_task resume and a resolution after the condition is met. Do not reject its quality without inspecting it. Reassign the verifier to a capable seated agent when appropriate. Before reporting a follow-up complete, create a revision task unless an existing open task already covers its acceptance criteria; name the task id. [TODO] text alone does not update the board.',
         'room_join and room_listen return yourTasks when the board is holding something for you. That is the only way to find out after being away, because board events are posted into the transcript and a transcript reaches whoever was present at the time.',
       ].join('\n'),
     inputSchema: {
@@ -822,12 +869,29 @@ export const FULL_TOOLS: ToolDef[] = [
       required: ['code', 'action'],
       properties: {
         code: CODE_PROP,
-        action: { type: 'string', enum: ['list', 'create', 'claim', 'submit', 'verify', 'reassign', 'cancel'], description: 'What to do' },
-        name: { type: 'string', description: 'Your display name (required for everything except list)' },
+        action: { type: 'string', enum: ['list', 'history', 'create', 'update', 'claim', 'submit', 'verify', 'reassign', 'cancel', 'wait', 'block', 'resume', 'ack', 'review_start', 'capabilities', 'renew', 'recover', 'release', 'handoff'], description: 'What to do. history reads retained task events (normal replies omit full timelines). claim starts a fenced execution; renew before expiry, recover after reading history, handoff to another agent. wait/block declares missing input; resume releases a wait. ack/review_start confirms receipt/start of a review. capabilities reports current context (agent-declared).' },
+        name: { type: 'string', description: 'Your display name (required for everything except list/history)' },
+        seatKey: { type: 'string', description: 'Private seat key returned by room_join — the seat proof for claim/submit/verify/wait/resume/renew/recover/release/handoff/ack/capabilities. Never send it in chat.' },
+        attemptId: { type: 'string', description: 'Current execution token returned by claim/recover; required on submit/renew/release/handoff.' },
+        ttlMs: { type: 'integer', minimum: 1, maximum: 86400000, description: 'claim/renew/recover: execution lease duration (default 15 minutes), independent of room lifetime.' },
+        to: { type: 'string', description: 'handoff: a different seated agent who can execute this task' },
+        limit: { type: 'integer', minimum: 1, maximum: 50, description: 'history: events per page (default 25, maximum 50)' },
+        beforeEventId: { type: 'string', description: 'history: nextBeforeEventId from the previous page; a trimmed cursor must restart from the latest page' },
+        requirements: { type: 'object', additionalProperties: false, properties: { owner: TASK_REQUIREMENT, review: TASK_REQUIREMENT }, description: 'create/update: known capability requirements for the owner and reviewer (update replaces the whole object)' },
+        capabilities: { type: 'object', description: 'capabilities: your actual current context; unknown stays unknown', properties: { workspaceId: { type: 'string' }, repository: { type: 'string' }, revision: { type: 'string' },
+          tools: { type: 'object', properties: Object.fromEntries(['commands', 'room_files', 'native_continuation'].map(key => [key, { type: 'string', enum: ['yes', 'no', 'unknown'] }])) } } },
+        scope: { type: 'string', enum: ['owner', 'review'], description: 'wait: owner work or peer review (default owner)' },
+        reasonCode: { type: 'string', enum: ['missing_user_input', 'missing_credential', 'tool_failure', 'dependency', 'other'], description: 'wait: why it cannot proceed' },
+        waitingFor: { type: 'string', description: 'wait: seated participant who can supply the missing input (default host)' },
+        resumeWhen: { type: 'string', description: 'wait: condition that must be satisfied before resuming' },
+        resolution: { type: 'string', description: 'resume/recover: how the missing condition was met, or what existing work you will continue' },
+        notificationId: { type: 'string', description: 'ack/review_start: current review event id from yourTasks.reviewEvents' },
+        since: { type: 'integer', minimum: 0, description: 'wait/resume: last consumed room cursor, echoed into the next listen' },
+        hostKey: { type: 'string', description: 'wait/resume: the host key, when the host declares or releases a wait' },
         id: { type: 'string', description: 'Task id, e.g. "T-01" (claim/submit/verify/reassign/cancel; optional explicit id on create)' },
         title: { type: 'string', description: 'create: short task title' },
         owner: { type: 'string', description: 'create/reassign: producer display name' },
-        verifier: { type: 'string', description: 'create/reassign: verifier display name — optional, and must differ from owner when given. Name another AGENT, or leave unset: humans rule from the board UI, not through this tool, so a human named here can never verify. Unset means any non-owner agent may rule later.' },
+        verifier: { type: 'string', description: 'create/reassign: independent reviewer, must differ from owner. Optional: on submission the server assigns an available non-owner agent, or records that the task is waiting for one. A human named here rules from the board UI, not through this tool.' },
         dod: { type: 'string', description: 'create: definition of done / acceptance criteria' },
         fileListing: { type: 'string', description: 'submit: real directory listing proving files exist' },
         fileExcerpt: { type: 'string', description: 'submit: real excerpt of the key file' },
@@ -836,7 +900,7 @@ export const FULL_TOOLS: ToolDef[] = [
         checks: { type: 'string', description: 'submit: each done-when criterion and how you verified it (use this for work that has no test run instead of inventing an exitCode)' },
         verdict: { type: 'string', enum: ['done', 'rejected'], description: 'verify: your ruling' },
         note: { type: 'string', description: 'verify: reasoning / what to fix (optional)' },
-        reason: { type: 'string', description: 'cancel: optional reason shown in the cancelled lane' },
+        reason: { type: 'string', description: 'wait/block: required description of the missing input. cancel: optional archive reason.' },
       },
     },
   },
@@ -1032,6 +1096,18 @@ export async function callTool(
       if (e.code === 'WebhookLimitError') {
         return ok({ error: 'webhook_limit', hint: `${e.message} Unregister one first (room_webhook action="unregister").` });
       }
+      if (e.code.startsWith('task_execution_')) {
+        if (e.code === 'task_execution_room_closed') return ok({ error: e.code, message: e.message, listenStatus: 'ended', stay: false });
+        const hint = e.code === 'task_execution_decision_required' ? 'Wait for an explicit reopen/cancel decision; do not automatically retry.'
+          : e.code === 'task_execution_legacy_lease'
+            ? 'Use the authenticated fleet lease service for this task; do not retry through name-only task actions.'
+            : e.code === 'task_execution_identity_required'
+              ? identityRequiredHint(typeof rawArgs.seatKey === 'string' && rawArgs.seatKey.length > 0)
+              : e.code === 'task_execution_capability_required' || e.code === 'task_execution_context_changed'
+                ? 'Report actual current context using room_task capabilities. Missing access needs a recorded wait or a capable agent; do not invent capability reports.'
+                : 'Read the current board and attempt history. Recover explicitly or request a handoff; do not blindly retry old submissions. Lease expiry does not end the room or fail the task.';
+        return ok({ error: e.code, message: e.message, hint });
+      }
       return { ...ok({ error: e.code, message: e.message }), isError: true };
     }
     throw e;
@@ -1133,6 +1209,8 @@ async function dispatch(
         // Hand this back on your next room_join to keep this seat. Only this
         // caller ever sees it; the server stores a hash.
         seatKey: updated.seatKey,
+        // No server-derived seat origin here: the key above is the only seat proof.
+        ...(updated.seatKey ? { seatProof: SEAT_KEY_REQUIRED_NOTICE } : {}),
         canSpeak: !muted,
         replyMode: updated.replyMode ?? 'open',
         participants: updated.participants.map(p => ({
@@ -1326,7 +1404,7 @@ async function dispatch(
       const messages = result.messages.map(slimMessage);
       const inbox = result.messages.length > 0 && !result.terminated
         ? await boardInbox(client, profile, a.code, selfName ?? '', result.addressedYou === true)
-        : { toVerify: [], toDo: [], current: [], queued: [], hint: '' };
+        : { toVerify: [], toDo: [], current: [], queued: [], hint: '' } as TaskInbox;
       const mustWork = inboxRequiresWork(inbox);
       return ok({
         messages,
@@ -1415,7 +1493,87 @@ async function dispatch(
     }
 
     case 'room_task': {
+      const proof = {
+        ...(typeof a.seatKey === 'string' && a.seatKey ? { seatKey: a.seatKey } : {}),
+        ...(typeof a.attemptId === 'string' && a.attemptId ? { attemptId: a.attemptId } : {}),
+      };
       switch (a.action) {
+        case 'history': {
+          const err = requireFields(a, ['id']);
+          if (err) return ok({ error: 'bad_request', hint: err });
+          const limit = a.limit ?? 25;
+          if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50
+            || (a.beforeEventId !== undefined && (typeof a.beforeEventId !== 'string' || !a.beforeEventId))) {
+            return ok({ error: 'bad_request', hint: 'history requires limit 1..50 and a nonempty beforeEventId when supplied.' });
+          }
+          const body = await client.post<{ board: TaskBoard | null }>({ action: 'taskBoard', code: a.code });
+          const task = body.board?.tasks.find(row => row.id === a.id);
+          if (!task) return ok({ error: 'task_not_found', id: a.id });
+          const rows = [...(task.timeline ?? [])].reverse();
+          const cursor = a.beforeEventId === undefined ? -1 : rows.findIndex(event => event.id === a.beforeEventId);
+          if (a.beforeEventId !== undefined && cursor === -1) {
+            return ok({ error: 'history_cursor_expired',
+              hint: 'The cursor is no longer retained. Restart history without beforeEventId; do not assume events were read.' });
+          }
+          const events = rows.slice(cursor + 1, cursor + 1 + limit);
+          return ok({ id: task.id, events, olderEventsDropped: task.timelineDropped ?? 0,
+            ...(cursor + 1 + events.length < rows.length ? { nextBeforeEventId: events[events.length - 1]!.id } : {}),
+            hint: 'Observed server facts and participant reports only. Publication does not prove receipt; external IDE stop reasons may be unknown.' });
+        }
+        case 'update': {
+          const err = requireFields(a, ['name', 'id']);
+          if (err) return ok({ error: 'bad_request', hint: err });
+          if (a.title === undefined && a.dod === undefined && a.requirements === undefined) {
+            return ok({ error: 'bad_request', hint: 'update requires title, dod or the full requirements object.' });
+          }
+          const body = await client.post<{ board: TaskBoard; task: Task }>({ action: 'taskUpdate', code: a.code, id: a.id, requesterName: a.name,
+            ...(a.title !== undefined ? { title: a.title } : {}), ...(a.dod !== undefined ? { dod: a.dod } : {}),
+            ...(a.requirements !== undefined ? { requirements: a.requirements } : {}) });
+          return ok({ task: body.task, board: body.board });
+        }
+        case 'capabilities': {
+          const err = requireFields(a, ['name', 'capabilities']);
+          if (err) return ok({ error: 'bad_request', hint: err });
+          return ok(await client.post({ action: 'agentCapabilities', code: a.code, name: a.name, capabilities: a.capabilities, ...proof }));
+        }
+        case 'renew':
+        case 'recover':
+        case 'release':
+        case 'handoff': {
+          const err = requireFields(a, ['name', 'id']);
+          if (err) return ok({ error: 'bad_request', hint: err });
+          const body = await client.post<{ board: TaskBoard; task: Task }>({ action: 'taskExecution', operation: a.action,
+            code: a.code, id: a.id, name: a.name, client: 'cc', ...proof,
+            ...(typeof a.ttlMs === 'number' ? { ttlMs: a.ttlMs } : {}), to: a.to, resolution: a.resolution });
+          return ok({ task: body.task, board: body.board, execution: body.task.execution, lease: body.task.lease,
+            hint: a.action === 'release' ? 'Execution released; the task remains open for explicit recovery.'
+              : `Use attemptId ${body.task.execution?.attemptId} on submit and renew. Explicitly renew before ${body.task.lease?.expiresAt}; room_listen does not renew task execution.` });
+        }
+        case 'ack':
+        case 'review_start': {
+          const err = requireFields(a, ['name', 'id']);
+          if (err) return ok({ error: 'bad_request', hint: err });
+          const body = await client.post<{ board: TaskBoard; task: Task }>({ action: 'taskReviewAck', code: a.code,
+            id: a.id, name: a.name, client: 'cc', started: a.action === 'review_start', notificationId: a.notificationId, ...proof });
+          return ok({ task: body.task, board: body.board, nextAction: { required: true, kind: 'task_review', action: 'verify_task',
+            taskId: a.id, instruction: 'Independently inspect the evidence now, then room_task verify. Missing access requires room_task wait with scope review.' } });
+        }
+        case 'wait':
+        case 'block':
+        case 'resume': {
+          const err = requireFields(a, ['name', 'id', ...(a.action === 'resume' ? ['resolution'] : ['reason', 'resumeWhen', 'reasonCode'])]);
+          if (err) return ok({ error: 'bad_request', hint: err });
+          const body = await client.post<{ board: TaskBoard; task: Task }>({
+            action: a.action === 'resume' ? 'taskResume' : 'taskWait', code: a.code, id: a.id,
+            name: a.name, client: 'cc', scope: a.scope ?? 'owner', reasonCode: a.reasonCode,
+            reason: a.reason, resumeWhen: a.resumeWhen, waitingFor: a.waitingFor, resolution: a.resolution,
+            ...(typeof a.hostKey === 'string' && a.hostKey ? { hostKey: a.hostKey } : {}),
+            ...proof,
+          });
+          const inbox = taskInboxFor(body.board, a.name);
+          return ok({ task: body.task, board: body.board, yourTasks: inbox,
+            nextAction: nextActionForInbox(inbox, a.code, Number.isSafeInteger(a.since) && a.since >= 0 ? a.since : 0, a.name), hint: inbox.hint });
+        }
         case 'list': {
           const body = await client.post<{ board: TaskBoard }>({ action: 'taskBoard', code: a.code });
           return ok({ board: body.board });
@@ -1433,6 +1591,7 @@ async function dispatch(
             ...(a.verifier ? { verifier: a.verifier } : {}),
             ...(await roleClients(client, a.code, a.owner, a.verifier)),
             ...(a.dod ? { dod: a.dod } : {}),
+            ...(a.requirements ? { requirements: a.requirements } : {}),
           });
           return ok({ task: body.task, board: body.board });
         }
@@ -1440,18 +1599,24 @@ async function dispatch(
           const err = requireFields(a, ['name', 'id']);
           if (err) return ok({ error: 'bad_request', hint: err });
           const body = await client.post<{ board: TaskBoard; task: Task }>({
-            action: 'taskClaim', code: a.code, id: a.id, name: a.name, client: 'cc',
+            action: 'taskClaim', code: a.code, id: a.id, name: a.name, client: 'cc', ...proof,
+            ...(typeof a.ttlMs === 'number' ? { ttlMs: a.ttlMs } : {}),
           });
           return ok({
             task: body.task,
             board: body.board,
+            execution: body.task.execution,
+            lease: body.task.lease,
+            ...(body.task.execution ? { renewExecution: { tool: 'room_task', arguments: { code: a.code, name: a.name,
+              id: a.id, action: 'renew', attemptId: body.task.execution.attemptId } } } : {}),
             workNext: {
               required: true,
               action: 'execute_task',
               id: body.task.id,
               instruction:
                 `Work on ${body.task.id} now. Do not send a status-only room message. `
-                + 'Return to room_task submit only after producing verifiable evidence, or report one concrete blocker.',
+                + (body.task.execution ? `Use attemptId ${body.task.execution.attemptId} (with your seatKey) on submit/renew. Renew explicitly before ${body.task.lease?.expiresAt}; listening does not renew execution. ` : '')
+                + 'Return to room_task submit only after producing verifiable evidence, or record a room_task wait for one concrete blocker.',
             },
           });
         }
@@ -1481,6 +1646,7 @@ async function dispatch(
             id: a.id,
             name: a.name,
             client: 'cc',
+            ...proof,
             evidence: {
               fileListing: a.fileListing,
               fileExcerpt: a.fileExcerpt,
@@ -1522,7 +1688,7 @@ async function dispatch(
           const err = requireFields(a, ['name', 'id', 'verdict']);
           if (err) return ok({ error: 'bad_request', hint: err });
           const body = await client.post<{ board: TaskBoard; task: Task }>({
-            action: 'taskVerify', code: a.code, id: a.id, name: a.name, client: 'cc', verdict: a.verdict, note: a.note,
+            action: 'taskVerify', code: a.code, id: a.id, name: a.name, client: 'cc', verdict: a.verdict, note: a.note, ...proof,
           });
           return ok({ task: body.task, board: body.board });
         }
@@ -1555,7 +1721,7 @@ async function dispatch(
           return ok({ task: body.task, board: body.board });
         }
         default:
-          return ok({ error: 'bad_request', hint: 'room_task action must be one of: list, create, claim, submit, verify, reassign, cancel.' });
+          return ok({ error: 'bad_request', hint: 'room_task action must be one of: list, history, create, update, claim, submit, verify, reassign, cancel, wait, block, resume, ack, review_start, capabilities, renew, recover, release, handoff.' });
       }
     }
 
