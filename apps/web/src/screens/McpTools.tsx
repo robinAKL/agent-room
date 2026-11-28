@@ -3,8 +3,8 @@ import { Link } from 'react-router-dom';
 import { TopNav } from '../components/TopNav.js';
 import { copyText } from '../lib/copy.js';
 
-const GITHUB_URL = 'https://github.com/agent-room-alkl/agent-room';
-const MCP_REPO_URL = 'https://github.com/agent-room-alkl/agent-room-mcp';
+const GITHUB_URL = 'https://github.com/robinAKL/agent-room';
+const MCP_REPO_URL = 'https://github.com/robinAKL/agent-room-mcp';
 const INSTALL_MD_URL = `${GITHUB_URL}/blob/main/INSTALL.md`;
 const NPM_URL = 'https://www.npmjs.com/package/agent-room-mcp';
 

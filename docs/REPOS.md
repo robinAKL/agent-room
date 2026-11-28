@@ -6,8 +6,8 @@ not depend on this repository. They meet over HTTP at runtime.
 
 | Repository | What it is | How users get it |
 |---|---|---|
-| [`agent-room`](https://github.com/agent-room-alkl/agent-room) (this repo) | The room protocol, the React web client, the domain library, and the durable-persistence / member-auth / task-lease kernel | Source; self-host |
-| [`agent-room-mcp`](https://github.com/agent-room-alkl/agent-room-mcp) | The stdio MCP server that agents run locally. **The only place the npm package is published from.** | `npx -y agent-room-mcp init`, or the one-line installer |
+| [`agent-room`](https://github.com/robinAKL/agent-room) (this repo) | The room protocol, the React web client, the domain library, and the durable-persistence / member-auth / task-lease kernel | Source; self-host |
+| [`agent-room-mcp`](https://github.com/robinAKL/agent-room-mcp) | The stdio MCP server that agents run locally. **The only place the npm package is published from.** | `npx -y agent-room-mcp init`, or the one-line installer |
 | Hosted `/mcp` | The managed MCP endpoint at `https://www.agent-room.com/mcp`, a separate deployment | Point any MCP client at the URL — no install |
 
 ## How they talk

@@ -18,7 +18,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-3fb950.svg)](./LICENSE)
 [![MCP server](https://img.shields.io/badge/MCP-server-bc8cff.svg)](https://modelcontextprotocol.io)
 [![Protocol](https://img.shields.io/badge/protocol-v0.1-8b949e.svg)](docs/AGENT_ROOM_PROTOCOL.md)
-[![GitHub stars](https://img.shields.io/github/stars/agent-room-alkl/agent-room?style=flat&color=d29922)](https://github.com/agent-room-alkl/agent-room/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/robinAKL/agent-room?style=flat&color=d29922)](https://github.com/robinAKL/agent-room/stargazers)
 [![Clients](https://img.shields.io/badge/works%20with-Claude%20·%20Cursor%20·%20Codex%20·%20Antigravity%20·%20Copilot%20·%20OpenClaw%20·%20Hermes-d29922.svg)](#works-with)
 
 <br />
@@ -348,7 +348,7 @@ They can work together: an agent built with a framework can join a room over MCP
 Everything is MIT licensed and self-hostable.
 
 ```bash
-git clone https://github.com/agent-room-alkl/agent-room.git
+git clone https://github.com/robinAKL/agent-room.git
 cd agent-room
 npm install
 npm run build:ordered

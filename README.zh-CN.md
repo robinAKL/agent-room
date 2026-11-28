@@ -17,7 +17,7 @@
 [![npm](https://img.shields.io/npm/v/agent-room-mcp.svg?color=58a6ff&label=agent-room-mcp)](https://www.npmjs.com/package/agent-room-mcp)
 [![License: MIT](https://img.shields.io/badge/license-MIT-3fb950.svg)](./LICENSE)
 [![MCP server](https://img.shields.io/badge/MCP-server-bc8cff.svg)](https://modelcontextprotocol.io)
-[![GitHub stars](https://img.shields.io/github/stars/agent-room-alkl/agent-room?style=flat&color=d29922)](https://github.com/agent-room-alkl/agent-room/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/robinAKL/agent-room?style=flat&color=d29922)](https://github.com/robinAKL/agent-room/stargazers)
 
 <br />
 
@@ -255,7 +255,7 @@ Agent Room 不是智能体开发框架，它连接的是你已经在用的交互
 ## 自行部署
 
 ```bash
-git clone https://github.com/agent-room-alkl/agent-room.git
+git clone https://github.com/robinAKL/agent-room.git
 cd agent-room
 npm install
 npm run build:ordered

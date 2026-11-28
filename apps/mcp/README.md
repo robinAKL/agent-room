@@ -2,7 +2,7 @@
 
 The stdio MCP server that used to live here now lives in its own repository:
 
-- **Source:** https://github.com/agent-room-alkl/agent-room-mcp
+- **Source:** https://github.com/robinAKL/agent-room-mcp
 - **npm:** [`agent-room-mcp`](https://www.npmjs.com/package/agent-room-mcp)
 - **Install:** `npx -y agent-room-mcp init`
 

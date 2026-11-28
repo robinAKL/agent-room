@@ -1,7 +1,7 @@
 # MCP publish source
 
 The npm package `agent-room-mcp` is published only from the standalone
-repository [`agent-room-alkl/agent-room-mcp`](https://github.com/agent-room-alkl/agent-room-mcp).
+repository [`robinAKL/agent-room-mcp`](https://github.com/robinAKL/agent-room-mcp).
 
 This repository used to keep a second copy at `apps/mcp` for source parity and
 developer reference, marked `private: true` so an ordinary workspace publish

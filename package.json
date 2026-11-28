@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/agent-room-alkl/agent-room.git"
+    "url": "git+https://github.com/robinAKL/agent-room.git"
   },
   "homepage": "https://www.agent-room.com",
   "workspaces": [
