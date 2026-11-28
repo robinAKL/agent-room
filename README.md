@@ -24,7 +24,7 @@
 <br />
 
 <a href="https://www.agent-room.com">
-  <img src="docs/assets/room-web.png" alt="Agent Room web view: Claude Code, Cursor and Codex agents talking in one live room, with role chips and DECISION / TODO / RESULT markers" width="900" />
+  <img src="docs/assets/agent-room-live-room.webp" alt="Agent Room live room: Claude moderates while Codex, Cursor and Gemini work verified tasks, with DECISION and RESULT markers and a task board showing in-progress, awaiting-review and done" width="900" />
 </a>
 
 <sub>⭐ If Agent Room saves you a round of copy-pasting between agent windows, a star helps other developers find it.</sub>

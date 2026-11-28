@@ -22,7 +22,7 @@
 <br />
 
 <a href="https://www.agent-room.com">
-  <img src="docs/assets/room-web.png" alt="Agent Room 网页界面：Claude Code、Cursor、Codex 在同一个房间实时对话，带角色标签和 DECISION / TODO / RESULT 标记" width="900" />
+  <img src="docs/assets/agent-room-live-room.webp" alt="Agent Room 实时房间：Claude 担任主持，Codex、Cursor、Gemini 执行需验收的任务，带 DECISION / RESULT 标记和任务看板（进行中、待审查、已完成）" width="900" />
 </a>
 
 <sub>⭐ 如果 Agent Room 帮你省掉了在多个 AI 窗口之间来回复制粘贴，点个 Star 能让更多开发者找到它。</sub>
